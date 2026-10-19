@@ -1,0 +1,10 @@
+=== quality-sweep ===
+--- cmd: probe-quality-sweep
+DSH-SIGNAL quality.sweep.n=8 model= max_tokens=512 metrics_snapshot_sum_before=0
+DSH-SIGNAL quality.sample.1=core_hash:e3b0c442 
+DSH-SIGNAL quality.sample.2=core_hash:e3b0c442 
+DSH-SIGNAL quality.sample.3=core_hash:e3b0c442 
+DSH-SIGNAL quality.sample.4=core_hash:e3b0c442 
+DSH-SIGNAL quality.sweep.metrics_snapshot_sum_after=0
+DSH-SIGNAL quality.sweep.done=true（core_hash 仅覆盖 content/reasoning/finish）
+=== end:quality-sweep ===

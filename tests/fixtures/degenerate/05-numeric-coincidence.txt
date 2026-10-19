@@ -1,0 +1,11 @@
+=== metrics-full ===
+--- cmd: probe-metrics-full
+--- 指标族清单（不带标签，用于确认哪些证据可采）:
+vllm:gpu_cache_usage_perc
+vllm:num_preemptions_total
+vllm:prefix_cache_hit_rate
+=== end:metrics-full ===
+=== vllm-log ===
+--- cmd: probe-vllm-log
+(EngineCore pid=98) INFO with config: kv_cache_dtype=auto, block_size=128, cudagraph_capture_sizes=[1, 96, 104]
+=== end:vllm-log ===

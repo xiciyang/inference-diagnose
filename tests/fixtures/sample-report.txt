@@ -1,0 +1,9 @@
+=== fake-health ===
+--- cmd: echo FAKE-HEALTH-OK
+FAKE-HEALTH-OK
+=== end:fake-health ===
+=== fake-errors ===
+--- cmd: echo 'XERR 0xDEAD code=77'
+XERR 0xDEAD code=77
+device <SERIAL> reported XERR 0xDEAD at <IP>
+=== end:fake-errors ===

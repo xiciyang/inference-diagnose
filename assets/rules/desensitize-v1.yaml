@@ -1,0 +1,36 @@
+id: desensitize-v1
+version: 1
+# 脱敏规则（硬依赖源）。pattern 为 ERE 兼容正则；replacement 为字面量
+# （不使用反向引用，保证 JS 与生成脚本里的 sed 语义完全一致）。
+# 每个 probe 的输出先过本规则集，再写入报告文件 —— 报告在用户服务器侧也不含明文。
+rules:
+  - field: ipv4
+    label: IPv4 地址
+    pattern: '([0-9]{1,3}\.){3}[0-9]{1,3}'
+    replacement: '<IP>'
+  - field: mac
+    label: MAC 地址
+    pattern: '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}'
+    replacement: '<MAC>'
+  - field: host_serial
+    label: 设备序列号
+    # 修订（2026-09-18，P2 门禁实测发现）：原 [0-9]{6,}[A-Z]{4,} 匹配不上真实序列号格式
+    # （如 210235A4KQ11Z —— 数字段后是 A4KQ，含数字），故放宽为"≥6 位数字 + 首字母大写 + ≥3 位字母数字"。
+    pattern: '[0-9]{6,}[A-Z][A-Z0-9]{3,}'
+    replacement: '<SERIAL>'
+  - field: phone
+    label: 手机号
+    pattern: '1[3-9][0-9]{9}'
+    replacement: '<PHONE>'
+  - field: user_path
+    label: 含用户名路径
+    pattern: '/(home|Users)/[A-Za-z0-9._-]+'
+    replacement: '/***/<USER>'
+  - field: key_prefix
+    label: 凭据前缀
+    pattern: '(sk|ghp|AKIA)[A-Za-z0-9_-]{8,}'
+    replacement: '<KEY>'
+  - field: internal_domain
+    label: 内网域名
+    pattern: '[a-z0-9-]+\.(corp|internal|local)(\.[a-z]{2,})?'
+    replacement: '<DOMAIN>'

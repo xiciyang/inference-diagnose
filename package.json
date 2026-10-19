@@ -1,0 +1,54 @@
+{
+  "name": "@xiciyang/inference-diagnose",
+  "version": "0.1.0",
+  "description": "LLM 推理服务崩溃诊断：生成定制采集脚本 → 离线脱敏报告解析 → 根因诊断+修复方案 → 失败后按证据差异定向补采（离线/脱敏/证据链驱动，三维可插拔）",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "assets",
+    "model",
+    "cordis.patch.yml"
+  ],
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "cordis": ">=4.0.0-rc <5"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "test": "node tests/run.mjs"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "inference",
+    "diagnosis",
+    "vllm",
+    "ascend"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiciyang/inference-diagnose.git"
+  },
+  "homepage": "https://github.com/xiciyang/inference-diagnose#readme",
+  "bugs": {
+    "url": "https://github.com/xiciyang/inference-diagnose/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.0 <0.3.0",
+    "node": ">=20"
+  }
+}

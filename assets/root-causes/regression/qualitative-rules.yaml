@@ -1,0 +1,181 @@
+id: regression-qualitative-rules
+version: 1
+# ── B 范式（性能劣化）定性规则簇 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# 仅在**基线不可用**的降级路径启用（D0–D3 全成立 → 降级声明，不 REFUSE）。
+# 判据是"当前报告里的状态信号"，回答"当前为什么慢"，**不下"相对基线劣化了多少"的结论**。
+# 每条规则的 when 匹配单行证据；跨行/跨段的条件用 requires（合取）。
+rules:
+  # 正则纪律（2026-09-28 真实端点实测缺陷）：`when` 只许匹配**承载判据的那一行**。
+  # 反面教训（本机真实端点实测）：① `抢占` 命中了**本插件探针自己的段内标签文本**
+  # （`--- 抢占/KV/队列/调度 ...`）；② `kv_cache.*(9[0-9]|100)` 命中了启动配置里的 `96`；
+  # ③ `speculative` 命中 `speculative_config=None`（推测解码其实是关的）；
+  # ④ `temp` 命中 `chat-template` / `temp0-run1`。故一律改为"必须带值/带冒号/带边界"。
+  - id: rg-qual-001
+    when: 'num_preemptions_total(\{|[ \t]+[1-9])|DSH-SIGNAL\s+perf\.num_preemptions=[1-9]|preempted|被抢占'
+    signalExample: ['vllm:num_preemptions_total{model="q"} 12', 'DSH-SIGNAL perf.num_preemptions=120', 'request preempted due to KV pressure', '请求被抢占']
+    judgement: decisive
+    decisiveRationale: '命中的是抢占计数的**取值**（`num_preemptions_total{…} N` 且 N≥1，或 `DSH-SIGNAL perf.num_preemptions=[1-9]`，或 `preempted`）：抢占行为的发生是计数器/日志直接记录的事实，不是配置存在性；计数器为 0 时不命中。'
+    hypothesis: '抢占/重排正在发生：请求因 KV 不足被驱逐后重新排队，是"时延高 + 吞吐低"的典型上游（当前状态判据，不依赖基线）'
+    minEvidence: 1
+    strong: true
+    relevance: '引擎指标或日志出现 preempt；需与 num_requests_waiting / kv_cache_usage 交叉确认为持续发生而非历史累计'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '降低并发上限（--max-num-seqs）或提高 KV 容量；长短请求分离到不同实例'
+      verification: '同流量复测 3 次：抢占增量不再增长，时延抖动收敛'
+      rollback: '恢复并发参数（报告已留存 cmdline）'
+      riskLevel: medium
+  - id: rg-qual-002
+    when: 'num_requests_waiting(\{|[ \t]+[1-9])|Waiting:\s*[1-9]|DSH-SIGNAL\s+perf\.num_waiting=[1-9]'
+    signalExample: ['vllm:num_requests_waiting{model="q"} 40', 'Waiting: 40', 'DSH-SIGNAL perf.num_waiting=40']
+    judgement: decisive
+    decisiveRationale: '命中的是等待队列的**取值**（`num_requests_waiting{…} N` 且 N≥1，或 `Waiting: N`）：队列非零即"请求正在排队"这一事实本身；队列为 0 时不命中。'
+    hypothesis: '请求排队积压：到达速率超过服务速率（并发超配或单请求变长），表现为全员变慢而非个别慢'
+    minEvidence: 1
+    relevance: '等待队列非零；若同时 Running 数低于 --max-num-seqs，则瓶颈不在并发上限而在单请求耗时'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '先量化到达率与单请求耗时，再决定是降并发、加实例还是优化长请求（chunked prefill / 前缀缓存）'
+      verification: '复测：Waiting 收敛到 0 且 P99 时延回落到可接受区间'
+      rollback: '恢复原并发与路由策略'
+      riskLevel: medium
+  - id: rg-qual-003
+    # 判据修正（2026-09-28，缺陷 #53）：旧正则 `…\\}[ \\t]+[0-9.]+` **匹配任意占用率数值**，
+    # 而假设是"接近打满"——数值出现了却**没有比较**。现改为可算判据：
+    #   when   = "占用率字段在场且值可读"（负责绑定证据，不再承担定性）
+    #   computeCheck.assert = '(threshold >= 90)'（负责定性：达不到 90% 即排除，可撤回）
+    # 归一化：vLLM `gpu_cache_usage_perc` 是 0–1 分数，日志里的 `kv … 96%` 是百分数，
+    # 故 expr 先归一到百分制：usage ≤ 1 时 ×100。
+    when: 'gpu_cache_usage_perc\{[^}]*\}[ \t]+[0-9.]+|DSH-SIGNAL\s+perf\.kv_cache_usage=[0-9.]+|kv[ _]?cache[^,\n]{0,40}?[0-9.]+[ \t]*%'
+    signalExample: ['vllm:gpu_cache_usage_perc{model_name="q"} 0.97', 'DSH-SIGNAL perf.kv_cache_usage=0.9713', 'KV cache usage: 96%']
+    judgement: quantitative
+    computeCheck:
+      expr: 'usage * (1 + (usage <= 1) * 99)'
+      assert: '(threshold >= 90)'
+      rationale: 'KV 占用率 <90% 时该行不构成"接近打满"，判据不成立 ⇒ 排除该假设（可撤回：改阈值或提供更贴近工况的判据）。90% 是 vLLM 官方指标的常见告警经验区，且与本规则 relevance 原已声明的"90%+ 区间"一致'
+      inputs:
+        - name: usage
+          pattern: '(?:gpu_cache_usage_perc\{[^}]*\}[ \t]+|DSH-SIGNAL\s+perf\.kv_cache_usage=|kv[ _]?cache[^,\n]{0,40}?(?=[0-9.]+[ \t]*%))([0-9.]+)'
+    hypothesis: 'KV 缓存已进入接近打满区间（占用率 ≥90%）：上下文长度或并发已超出可用 KV 容量'
+    minEvidence: 1
+    relevance: '占用率进入 90%+ 区间（阈值由本规则 computeCheck.assert 声明，可审计、可撤回）；是否已产生**实际驱逐**需与 num_preemptions_total 交叉确认——本规则只负责"接近打满"这一数值事实，不替它下"已发生驱逐"的结论'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '下调 --max-num-seqs 或 --max-model-len；或提高 --gpu-memory-utilization 并为 KV 预留更多显存'
+      verification: '复测：占用率回落到 85% 以下且不再出现抢占'
+      rollback: '恢复显存与并发参数'
+      riskLevel: medium
+  - id: rg-qual-004
+    # 判据修正（2026-09-28，缺陷 #53）：旧正则含 `Prefix cache hit rate:?\\s*[0-9]` 与
+    # `prefix_cache_hit_rate[ \\t={]` —— **匹配任意数值（乃至只有指标名）**，而假设是"命中率异常"。
+    # 现只保留**无需基线的下限事实**：命中率 == 0（0 是下界，不是领域判断）。
+    # "骤降（相对历史）"**不在此判定**——它需要基线，已由 B 定量规则 rg-perf-004 承担
+    # （metric=prefix_cache_hit_rate，warnRatio 1.25 / criticalRatio 1.6，方向 lower-worse）。
+    when: 'prefix_cache_hit_rate(?:\{[^}]*\})?[ \t]+0(?:\.0+)?(?![0-9.])|Prefix cache hit rate:?[ \t]*0(?:\.0+)?(?![0-9.])|DSH-SIGNAL\s+perf\.prefix_cache_hit_rate=0(?:\.0+)?(?![0-9.])'
+    signalExample: ['vllm:prefix_cache_hit_rate{model_name="q"} 0.0', 'Prefix cache hit rate: 0.0%', 'DSH-SIGNAL perf.prefix_cache_hit_rate=0.0000']
+    judgement: contextual
+    hypothesis: '前缀缓存命中率为 0（本轮观测内无任何前缀复用）：请求前缀互不相同（无共享 system prompt / 工具模板）、缓存被关闭或被完全驱逐——会直接抬高 TTFT'
+    minEvidence: 1
+    relevance: '本规则只判**无需基线的下限事实**「命中率为 0」；命中率为 0 也可能来自启动初期或本就无共享前缀的流量，故仍为 contextual。相对历史的「骤降」由 B 定量规则 rg-perf-004（基线比值 warnRatio 1.25 / criticalRatio 1.6）负责，两者不重复判定'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '确认 --enable-prefix-caching 未关闭；核对业务侧 system prompt / 工具模板版本；若因 KV 压力被驱逐则先降载'
+      verification: '同业务流量复测：命中率回到改动前水平'
+      rollback: '恢复缓存开关与模板版本'
+      riskLevel: low
+  - id: rg-qual-005
+    when: 'spec_decode_num_(accepted|draft)_tokens_total\{|speculative_config=\{|--speculative-config|num_speculative_tokens=[1-9]|draft[_-]model|acceptance_rate|接受率[:：]?\s*[0-9]'
+    signalExample: ['vllm:spec_decode_num_accepted_tokens_total{model="q"} 42', 'speculative_config={"model": "draft"}', '--speculative-config {"num_speculative_tokens": 5}', 'num_speculative_tokens=5', 'draft_model=/models/draft', 'acceptance_rate=0.42', '接受率 0.42']
+    judgement: contextual
+    hypothesis: '推测解码接受率偏低：draft 与 target 分布不符或输入分布偏移，导致"多算了草稿却没省时间"，反而拖慢 decode'
+    minEvidence: 1
+    relevance: '命中推测解码指标/配置；判据是接受率（accepted/draft）与基线或经验值对比'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '临时关闭推测解码（--speculative-model 置空 / num_speculative_tokens=0）复测；若时延反而下降，则确认是接受率问题'
+      verification: '开/关对照跑同一流量：比较 P99 与吞吐'
+      rollback: '恢复原推测解码配置'
+      riskLevel: low
+  - id: rg-qual-006
+    when: 'fallback|unsupported|aclnn|aicore|回退|boost'
+    signalExample: ['operator fallback to aicpu', 'unsupported op type', 'aclnnAddCustom failed', 'aicore timeout', '算子回退', 'boost mode enabled']
+    judgement: contextual
+    hypothesis: '算子回退：部分算子未走优化实现（或走了低效路径），表现为计算变慢（可能同时伴随精度异常）'
+    minEvidence: 1
+    needsProbes: [precision-log]
+    relevance: '引擎日志命中算子回退关键词；需定位到具体算子与回退原因'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      mode: partial
+      code: pending
+      note: '先从日志定位具体算子与回退原因，再决定：升级 HDK/算子库、调整算子开关、或规避该算子路径'
+      verification: '替换/开关后复测：该算子不再回退，时延回到预期区间'
+      rollback: '保留算子库版本与开关原值'
+      riskLevel: high
+  - id: rg-qual-007
+    when: '温度|throttle|降频|thermal|temp[^a-zA-Z0-9_]|frequency|freq_'
+    signalExample: ['温度过高', 'GPU throttle detected', '发生降频', 'thermal zone over temp', 'temp=85C', 'frequency 1200MHz', 'freq_cur=1200']
+    judgement: contextual
+    hypothesis: '设备温度/频率异常：进入降频区或热保护，计算性能下降（与负载相关，表现为"跑一会儿才慢"）'
+    minEvidence: 1
+    needsProbes: [npu-metrics]
+    relevance: '命中温度/降频关键词；判据是温度时间序列与频率是否持续低于额定值'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '核对散热与风道、机房温度与功耗上限；确认未被 BMC/固件限频；必要时降低持续负载或改善散热后复测'
+      verification: '复测温度序列：稳态温度回到阈值以下且频率不再跌落'
+      rollback: '恢复负载与功耗策略'
+      riskLevel: medium
+  - id: rg-qual-008
+    when: 'DSH-SIGNAL\s+metrics\.unavailable=true|evidence\.missing\.0=metrics_endpoint'
+    signalExampleExempt: 'when 匹配 metrics.unavailable=true / evidence.missing.0=metrics_endpoint，声明"无指标端点 ⇒ 排队/抢占/KV/缓存这几类机制在原理上不可判定"'
+    judgement: contextual
+    hypothesis: '证据缺口声明：本报告没有指标端点数据，因此"排队/抢占/KV/缓存"这几类机制**在原理上不可判定**——必须显式声明，不能当成"未发现反例"'
+    minEvidence: 1
+    strong: true
+    relevance: '用于防止"证据缺失被当成已排除"，并给出开启采集的方式（暴露 /metrics 或提供基线）'
+    fix: null
+  - id: rg-qual-009
+    when: 'DSH-SIGNAL\s+evidence\.missing\.'
+    signalExampleExempt: 'when 匹配 DSH-SIGNAL evidence.missing.*，是通用证据缺口声明（与 rg-qual-008 互补）'
+    judgement: contextual
+    hypothesis: '证据缺口声明（通用）：本报告缺少判定所需的部分证据，相关假设在原理上不可判定'
+    minEvidence: 1
+    relevance: '与 rg-qual-008 互补：008 针对指标端点，本条覆盖其它缺口（容器、请求参数、响应正文等）'
+    fix: null

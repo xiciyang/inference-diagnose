@@ -1,0 +1,15 @@
+id: fake-hardware
+kind: hardware
+displayName: P0 正向断言夹具（源码中从未出现过的硬件）
+version: 1
+probes:
+  - id: fake-health
+    section: fake-health
+    command: "echo FAKE-HEALTH-OK"
+  - id: fake-errors
+    section: fake-errors
+    command: "echo 'XERR 0xDEAD code=77'"
+ruleRefs:
+  - root-causes/fake-hardware-rules.yaml
+envHints:
+  note: 仅用于 no-brand-in-core 正向断言；不属于任何真实硬件品牌

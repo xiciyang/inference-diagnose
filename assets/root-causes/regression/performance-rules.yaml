@@ -1,0 +1,160 @@
+id: regression-performance-rules
+version: 1
+# ── B 范式（性能劣化）阈值规则簇 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# 与 A 的规则库分区不统一：本文件只在**提供了客户基线**时启用。
+#   metric        : 基线里的指标名（必须能对上；对不上 → 进 closure.unmeasuredMetrics）
+#   pattern       : 从当前报告证据里抽取当前值的正则（第一个捕获组为数字）
+#   direction     : higher-worse（越大越差）| lower-worse（越小越差）
+#   warnRatio     : 相对基线的比值告警阈（>1 表示比基线差；两个方向已归一化到同一判据）
+#   criticalRatio : 严重阈
+# 比值未达 warnRatio ⇒ 该假设被**排除**并进 closure.excludedHypotheses（可追溯、可撤回）。
+rules:
+  - id: rg-perf-001
+    metric: ttft_ms
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.ttft_ms=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.ttft_ms=420'
+    direction: higher-worse
+    warnRatio: 1.30
+    criticalRatio: 1.80
+    hypothesis: '首 token 延迟（TTFT）相对基线显著劣化：prefill 路径变慢（序列变长、prefill 被切碎、KV 分配/换入换出、前缀缓存不再命中）'
+    minEvidence: 1
+    strong: true
+    needsProbes: [metrics-full, effective-config]
+    relevance: '基线 ttft_ms 与当前报告 perf.ttft_ms 的比值；配合 prefix_cache / kv_cache / chunked-prefill 配置一起看'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '按比值档位处理：① 检查 --max-num-batched-tokens 与 --enable-chunked-prefill 是否被改动（prefill 被切碎会抬高 TTFT）；② 若 prefix_cache_hit_rate 同步下降，检查前缀缓存开关与请求前缀是否被改动；③ 若 kv_cache_usage 接近 100%，按并发上限（--max-num-seqs）降载或扩容 KV'
+      verification: '同 prompt/同并发复测 3 次：perf.ttft_ms 回到基线 1.2× 以内；且 prefix_cache_hit_rate 与 kv_cache_usage 同步回到基线区间'
+      rollback: '恢复改前的启动参数（报告已留存完整 cmdline）并重启服务'
+      riskLevel: medium
+  - id: rg-perf-002
+    metric: e2e_ms
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.e2e_ms=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.e2e_ms=3600'
+    direction: higher-worse
+    warnRatio: 1.25
+    criticalRatio: 1.60
+    hypothesis: '端到端时延相对基线劣化：生成阶段变慢或排队加剧（decode 吞吐下降、抢占/重排、批形状变化、设备降频）'
+    minEvidence: 1
+    strong: true
+    needsProbes: [metrics-full]
+    relevance: '基线 e2e_ms 与当前 perf.e2e_ms 的比值；与 num_preemptions / num_requests_waiting / 温度序列交叉'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '先区分"排队"与"计算变慢"：若 num_requests_waiting 与 num_preemptions 同步上升 → 降并发或提高调度预算（--max-num-seqs / --max-num-batched-tokens）；若队列正常而时延上升 → 查设备频率、温度与算子回退（见 precision-log / npu-metrics 段）'
+      verification: '固定并发复测 3 次：perf.e2e_ms 回到基线 1.15× 以内；抢占计数不再增长'
+      rollback: '恢复并发/调度参数与温度控制策略（报告已留存原值）'
+      riskLevel: medium
+  - id: rg-perf-003
+    metric: generation_tokens_per_s
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.generation_tokens_per_s=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.generation_tokens_per_s=810'
+    direction: lower-worse
+    warnRatio: 1.25
+    criticalRatio: 1.60
+    hypothesis: '生成吞吐相对基线下降：批处理效率下降（batch size 变小、抢占频繁）、推测解码接受率下降、或设备降频'
+    minEvidence: 1
+    needsProbes: [metrics-full, effective-config]
+    relevance: '基线吞吐与当前 perf.generation_tokens_per_s 的比值；与 spec_decode 接受率、--max-num-seqs、温度交叉'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '按序排查：① 推测解码接受率（spec_decode_num_accepted/draft）是否下降 → 关闭推测解码复测；② --max-num-seqs / --max-num-batched-tokens 是否被调小；③ NPU 频率与温度是否进入降频区；④ 是否出现算子回退（precision-log）'
+      verification: '同并发复测 3 次：吞吐回到基线 1.15× 以内；接受率/频率回到基线区间'
+      rollback: '逐项回滚（每次只改一项并记录原值）'
+      riskLevel: medium
+  - id: rg-perf-004
+    metric: prefix_cache_hit_rate
+    judgement: quantitative
+    pattern: '(?:DSH-SIGNAL\s+perf\.prefix_cache_hit_rate=|prefix_cache_hit_rate[^0-9]{0,40})([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.prefix_cache_hit_rate=0.3100'
+    direction: lower-worse
+    valueDomain: fraction   # C14：期望值域 0–1；>1 视为百分数，先 /100 再比值
+    warnRatio: 1.25
+    criticalRatio: 1.60
+    hypothesis: '前缀缓存命中率相对基线下降：请求前缀分布改变、缓存容量被挤占（KV 压力）或缓存被关闭——会连带抬高 TTFT'
+    minEvidence: 1
+    needsProbes: [metrics-full]
+    relevance: '基线命中率与当前值的比值；注意这是"比值"判据，命中率本身下降需先归一化（1/current vs 1/baseline）'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '确认 --enable-prefix-caching 未被关闭；核对业务侧是否改动了 system prompt / 工具模板（前缀变化会让缓存全部失效）；若 KV 压力导致驱逐，按并发上限降载'
+      verification: '同业务流量复测：命中率回到基线 0.8× 以内（比值 1.25 以内）'
+      rollback: '恢复缓存开关与模板版本'
+      riskLevel: low
+  - id: rg-perf-005
+    metric: kv_cache_usage_perc
+    judgement: quantitative
+    pattern: '(?:DSH-SIGNAL\s+perf\.kv_cache_usage=|gpu_cache_usage_perc[^0-9]{0,40})([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.kv_cache_usage=0.87'
+    direction: higher-worse
+    valueDomain: fraction   # C14：期望值域 0–1；>1 视为百分数，先 /100 再比值
+    warnRatio: 1.20
+    criticalRatio: 1.45
+    hypothesis: 'KV 缓存占用相对基线上升：上下文变长/并发变高导致 KV 压力上升，逼近上限后触发抢占与重排，表现为时延抖动'
+    minEvidence: 1
+    needsProbes: [metrics-full]
+    relevance: '基线占用率与当前值的比值；占用率是有界量（0–100），比值判据仅在基线本身较高时才有区分力'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '核对 --max-model-len / --max-num-seqs 与业务输入长度分布是否变化；必要时下调并发上限或提高 KV 显存占比（--gpu-memory-utilization），并按新负载重新定基线'
+      verification: '同负载复测：占用率回到基线 1.1× 以内且不再出现抢占'
+      rollback: '恢复并发与显存参数'
+      riskLevel: medium
+  - id: rg-perf-006
+    metric: num_preemptions
+    judgement: quantitative
+    pattern: '(?:DSH-SIGNAL\s+perf\.num_preemptions=|num_preemptions_total[^0-9]{0,40})([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.num_preemptions=120'
+    direction: higher-worse
+    warnRatio: 1.50
+    criticalRatio: 3.00
+    hypothesis: '抢占计数相对基线显著上升：调度器在被追加重排请求（KV 不足或长请求挤占），是"时延抖动 + 吞吐下降"的共同上游'
+    minEvidence: 1
+    needsProbes: [metrics-full]
+    relevance: '抢占是**累计计数**：比值判据要求基线与当前是同口径的时间窗，报告中已同时采集口径提示'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '降低并发上限（--max-num-seqs）或提高 KV 容量；若长请求与短请求混跑，按业务拆分实例（长短分离）'
+      verification: '同流量复测 3 次：抢占增量回到基线 1.2× 以内'
+      rollback: '恢复并发参数'
+      riskLevel: medium

@@ -1,0 +1,9 @@
+{
+  "dims": {
+    "framework": "vllm",
+    "runtime": "docker",
+    "hardware": "gb10"
+  },
+  "failures": [],
+  "at": "2026-09-29T04:29:57.486Z"
+}

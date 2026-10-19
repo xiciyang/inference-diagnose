@@ -1,0 +1,33 @@
+id: framework-mindie-rules
+version: 1
+appliesTo:
+  framework: mindie
+rules:
+  - id: rc-mindie-001
+    when: "abort|core dump|SIGABRT|RuntimeError"
+    signalExample: ['[ERROR] request abort due to device error', 'core dump generated at /var/crash/mindie.core', 'Process exited with SIGABRT', 'RuntimeError: NPU out of memory']
+    judgement: contextual
+    hypothesis: "推理框架进程异常终止（abort/core dump）：需结合 NPU 与内核日志定位触发源"
+    minEvidence: 1
+    strong: true
+    relevance: "框架日志出现终止记录，时间戳与其它维度证据需交叉"
+    fix:
+      code: "采集进程 core dump：coredumpctl info / 检查 /var/log/mindie 下的 abort 栈，按栈顶模块回滚对应组件版本"
+      verification: "重启服务并压测 30 分钟：无 abort、无 core dump 新增"
+      rollback: "恢复原组件版本（保留原版本 tar 包与配置备份）"
+      riskLevel: medium
+  - id: rc-mindie-003
+    when: "driver version|compat|version mismatch|HDK"
+    signalExample: ['driver version: 24.1.rc3', 'compat check failed for cann', 'version mismatch detected', 'HDK 24.1.RC3 installed']
+    judgement: contextual
+    hypothesis: "驱动/固件版本与框架要求不匹配"
+    minEvidence: 1
+    needsProbes: [npu-driver-matrix]
+    relevance: "版本不匹配是崩溃的常见诱因，但精确兼容版本需现场矩阵确认"
+    fix:
+      mode: partial
+      code: pending
+      note: "需先采集现场兼容矩阵（npu-driver-matrix）才能给出精确驱动版本与升级命令"
+      verification: "升级后跑官方兼容性自检 + 30 分钟压测"
+      rollback: "保留旧驱动包，按 npu-smi 记录的版本回刷"
+      riskLevel: high

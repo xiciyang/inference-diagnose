@@ -1,0 +1,27 @@
+id: ascend-arm
+kind: hardware
+displayName: 昇腾 ARM（通用 NPU）
+version: 4
+requires:
+  hardware: [ascend-arm]
+probes:
+  - id: npu-status
+    section: npu-status
+    command: "if command -v npu-smi >/dev/null 2>&1; then npu-smi info; else echo \"DSH-SIGNAL npu.status=unavailable (npu-smi 不存在：容器内未挂驱动工具或非 Ascend 宿主)\"; fi"
+  - id: npu-metrics
+    section: npu-metrics
+    command: "if command -v npu-smi >/dev/null 2>&1; then npu-smi info -t temp -c 0; else echo \"DSH-SIGNAL npu.metrics=unavailable (npu-smi 不存在)\"; fi"
+  - id: npu-thermal-history
+    section: npu-metrics
+    command: "if command -v npu-smi >/dev/null 2>&1; then S=${THERMAL_SAMPLES:-6}; I=${THERMAL_INTERVAL:-10}; echo \"DSH-SIGNAL npu.thermal.samples=$S interval=${I}s\"; for i in $(seq 1 \"$S\"); do npu-smi info -t temp -c 0; sleep \"$I\"; done; else echo \"DSH-SIGNAL npu.thermal=unavailable (npu-smi 不存在)\"; fi"
+  - id: npu-driver-matrix
+    section: npu-driver-matrix
+    command: "if command -v npu-smi >/dev/null 2>&1; then npu-smi info -t board -c 0; cat /usr/local/Ascend/driver/version.info 2>/dev/null || echo \"DSH-SIGNAL driver.versioninfo=missing\"; else echo \"DSH-SIGNAL driver.matrix=unavailable (npu-smi 不存在)\"; fi"
+  - id: kernel-log
+    section: kernel-log
+    command: "dmesg 2>/dev/null | tail -n 300 || echo \"DSH-SIGNAL kernel.log=unavailable (dmesg 需 root 或权限受限)\""
+  - id: driver-detail
+    section: npu-driver-matrix
+    command: "if command -v npu-smi >/dev/null 2>&1; then echo \"--- version.info:\"; cat /usr/local/Ascend/driver/version.info 2>/dev/null | head -14; echo \"--- npu-smi -m:\"; npu-smi info -m 2>/dev/null | head -20; echo \"--- board(试 -c 0):\"; npu-smi info -t board -c 0 2>/dev/null | head -20; echo \"--- board(试 -i 0 -c 0):\"; npu-smi info -t board -i 0 -c 0 2>/dev/null | head -20; echo \"--- err-count(chip0):\"; npu-smi info -t err-count -c 0 2>/dev/null | head -8; else echo \"DSH-SIGNAL driver.matrix=unavailable\"; fi"
+ruleRefs:
+  - root-causes/hardware-ascend-arm-rules.yaml

@@ -1,0 +1,139 @@
+id: methodology-rules
+version: 1
+# ── 方法论规则簇（2026-09-23，抽象自"QLI int32 溢出致偶发乱码"的成功定位）──
+#
+# 本文件的意义不是"多几条假设"，而是把那次成功所依赖的**推理动作**写成数据：
+#   requires     ：合取。多条件必须**各自**在证据里命中（可跨段、跨源）。
+#   falsifiedBy  ：否证。**只有当"若 H 为真则该痕迹必然出现"时才可写**——
+#                  否则会产生假排除（比不排除更糟）。必然痕迹举例：
+#                  进程被信号杀 → 内核/容器必有 OOM 记录；argparse 拒绝 → 必有 unrecognized arguments；
+#                  权重缺失 → present < declared；tokenizer 错 → 往返必失败；非确定性 → 两次完整重算 logprob 必不同。
+#   computeCheck ：可算判据。把"可能溢出/可能超限"变成数字；判据不成立 ⇒ 假设被**否证**并进入 excludedHypotheses 台账。
+#   causal       ：因果闭环门槛。缺"回切复现/双向开闭/二进制一致"时，置信度**不得**升到"已证明"。
+#   structural   ：结构标注（离散决策点优先于连续层——一处索引选错即污染后续所有层）。
+appliesTo:
+  framework: [vllm, mindie]
+rules:
+  - id: rc-idx-001
+    when: 'lightning_indexer|quant_lightning|QLIV2|GetKeyScale\(|kScaleBlkStride\s*[=:]|page[_-]?stride\s*[=:]|block_table\[|blockId\s*[=:]'
+    signalExample: ['lightning_indexer_v2 called', 'quant_lightning kernel', 'QLIV2 vector kernel', 'GetKeyScale(blk)', 'kScaleBlkStride = 73856', 'page_stride = 73856', 'block_table[1024]', 'blockId=29080']
+    judgement: quantitative
+    requires:
+      - when: 'stride|Stride|页跨度|page_stride'
+      - when: 'blockId|block_id|物理页|物理块'
+    computeCheck:
+      inputs:
+        - { name: stride, pattern: '(?:kScaleBlkStride|page_stride|页跨度)[^0-9]{0,12}([0-9]{3,})' }
+        - { name: maxBlock, pattern: 'blockId[^0-9]{0,20}([0-9]{3,})' }
+      expr: 'floor(2147483647 / stride) + 1'
+      assert: '(threshold <= maxBlock)'
+      rationale: '页号 × 页跨度按 int32 相乘；现场最大页号未达阈值时，该假设应被否证而非保留为"未发现反例"'
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(revert_repro|ab_toggle|binary_sha_match)=true'
+      requireForProven: true
+    structural: { kind: 'discrete-decision-point', note: '稀疏索引选择：一处选错即污染后续层的候选集，故误差在"层边界"处突跳' }
+    hypothesis: '索引/地址类根因：分页混合缓存下按"物理页号 × 页跨度"计算 K-scale 地址，两个 int32 相乘在高页号处溢出 → 读到相邻缓存数据 → 选错稀疏注意力候选 → **采样前 logits 已错**，采样与生成只是把它放大成文本乱码'
+    minEvidence: 1
+    strong: true
+    relevance: '可算判据：首个溢出页号 = floor(2^31 / 页跨度) + 1（例：跨度 73856 → 29077）。物理页号随运行历史变化，故表现为偶发；prefix cache 命中时不重算 prefill，会掩盖'
+    fix:
+      code: '把页跨度在**乘法之前**提升为 int64：`int64_t stride = static_cast<int64_t>(keyDequantScaleStride0); blockId * stride`。注意 `static_cast<int64_t>(blockId * stride32)` 无效——溢出已经发生'
+      verification: '① 低页号(1~4)与跨界高页号(如 29076~29079)分别用独立 CPU 参考公式校验 Top-K：修复后两者一致且分数不低于参考下界；② **回切旧算子必须再次复现**；③ 同编译环境重编未改源码的二进制 SHA256 应与原运行二进制一致，排除编译混淆'
+      rollback: '保留原算子二进制与源码版本，可按版本回切'
+      riskLevel: high
+  - id: rc-conf-shards-ok
+    when: 'shards_declared|shards_present|分片'
+    signalExample: ['DSH-SIGNAL weights.shards_declared=274', 'DSH-SIGNAL weights.shards_present=270', '模型分片数不完整']
+    judgement: quantitative
+    computeCheck:
+      inputs:
+        - { name: declared, pattern: 'shards_declared[^0-9]{0,6}([0-9]+)' }
+        - { name: present, pattern: 'shards_present[^0-9]{0,6}([0-9]+)' }
+      expr: 'declared - present'
+      assert: '(threshold > 0)'
+      rationale: '分片缺失是"若真则必见"的数值事实：present >= declared 时该假设被否证'
+    hypothesis: '权重分片不完整（present < declared）：加载到缺失/错位权重，输出语义崩坏'
+    minEvidence: 1
+    strong: true
+    relevance: '数值判据自动否决：分片齐全时本假设不成立'
+    fix:
+      code: '补齐缺失分片并核对分片命名与 index.json 声明一致，重新加载'
+      verification: 'present == declared；且同 prompt temp=0 输出与参考环境一致'
+      rollback: '保留原权重目录快照'
+      riskLevel: high
+  - id: rc-conf-tokenizer-ok
+    when: 'roundtrip_ok|roundtrip[=:]'
+    signalExample: ['DSH-SIGNAL tokenizer.roundtrip_ok=true', 'roundtrip_ok=false', 'roundtrip: ok']
+    judgement: quantitative
+    computeCheck:
+      inputs:
+        - { name: rt, pattern: 'roundtrip_ok=(true|false)' }
+      expr: '1 - rt'
+      assert: '(threshold > 0)'
+      rationale: '若 tokenizer 与权重不同源，往返解码必然失败；往返成功即否证该假设（必然痕迹）'
+    hypothesis: 'tokenizer 与权重不同源（词表/special tokens 错位）：token id 映射错误，输出"像词但不是词"'
+    minEvidence: 1
+    relevance: '往返判据（/tokenize → /detokenize）是最便宜的必然痕迹检验'
+    fix:
+      code: '用发布包内 tokenizer 全套文件整体替换，禁止混用；核对 config.vocab_size 与实际词表一致'
+      verification: '往返判别恢复 true；同 prompt temp=0 语义正确'
+      rollback: '保留原 tokenizer 目录 tar 包与 sha256'
+      riskLevel: medium
+  - id: rc-conf-nondet
+    when: 'prefill_repeat_consistent|logits\.|deterministic'
+    signalExample: ['prefill_repeat_consistent=false', 'DSH-SIGNAL logits.salt_supported=1', 'DSH-SIGNAL quality.deterministic=false']
+    judgement: quantitative
+    computeCheck:
+      inputs:
+        - { name: pc, pattern: 'prefill_repeat_consistent=(true|false)' }
+      expr: '1 - pc'
+      assert: '(threshold > 0)'
+      rationale: '若"采样前已漂移"成立，则两次完整重算的首 token logprob 必然不同；一致即否证'
+    hypothesis: '采样前已漂移（两次同输入完整重算首 token logprob 不同）：误差发生在前向/地址路径，而非采样、parser 或客户端'
+    minEvidence: 1
+    strong: true
+    relevance: '把"文本乱码"降维成"可比较数值"的判据；配合 cache_salt 可区分完整重算与缓存命中两条路径'
+    fix:
+      mode: partial
+      code: pending
+      note: '按"逐层中间结果余弦相似度"二分：dump embedding 与每层 hidden state，找首个显著放大点；再沿该层调用链下钻到原生算子，审计地址/索引计算（页号×跨度、stride、int32 乘法）'
+      verification: '修复后两次完整重算首 token logprob 必须一致；再跑 20 次长 prefill 无漂移'
+      rollback: 'dump 为只读，不改逻辑，无回滚需求'
+      riskLevel: medium
+    needsProbes: [logits-probe]
+  - id: rc-struct-sliding-eq-block
+    when: 'sliding_window|block.?size|滑窗'
+    signalExample: ['"sliding_window": 128', '--block-size 128', '滑窗长度等于分块长度']
+    judgement: quantitative
+    requires:
+      - when: 'sliding_window|滑窗'
+      - when: 'block.?size|block_size|块大小'
+    computeCheck:
+      inputs:
+        - { name: sw, pattern: 'sliding_window[^0-9]{0,6}([0-9]+)' }
+        - { name: blk, pattern: 'block[-_ ]?size[^0-9]{0,6}([0-9]+)' }
+      expr: 'blk - sw'
+      assert: '(threshold == 0)'
+      rationale: '仅当滑窗长度**恰好等于**分块长度时，"边界重合/前缀复用错位"才成立；不等则否证'
+    structural: { kind: 'discrete-decision-point', note: '窗口边界与分块边界重合 + chunked prefill + prefix cache：切分/复用错位会随上下文长度偶发' }
+    hypothesis: '滑窗长度恰好等于分块长度（sliding_window == block_size），叠加 chunked prefill 与 prefix cache：窗口/分块边界重合处发生切分或复用错位，接错上下文而偶发乱码'
+    minEvidence: 1
+    relevance: '数值判据：block_size - sliding_window == 0 才保留该假设'
+    fix:
+      code: '把 --block-size 调整为不与滑窗长度相等（如 256），或关闭 prefix caching / chunked prefill 后复测；一次只改一项'
+      verification: '同一 prompt 连跑 20 次（SAMPLE_N=20）比较异常比率；改一项复测一次'
+      rollback: '恢复原启动参数（报告已留存完整 cmdline）'
+      riskLevel: medium
+  # rc-conf-oom-trace 已删除（2026-09 合并到 rc-docker-001）：其 when 是
+  # rc-docker-001 的真子集 → 二者证据**同源**（实测命中集合逐条相同），按"同机制不留两条
+  # decisive 规则"合并；否证条件（只有 137 而无 OOM/SHM 痕迹时排除）随之迁入
+  # runtime-docker-rules.yaml 的 rc-docker-001，使该规则对全部框架组合可达。
+  - id: rc-causal-001
+    when: 'DSH-SIGNAL causal\.(revert_repro|ab_toggle|binary_sha_match)=true'
+    signalExample: ['DSH-SIGNAL causal.revert_repro=true', 'DSH-SIGNAL causal.ab_toggle=true', 'DSH-SIGNAL causal.binary_sha_match=true']
+    judgement: contextual
+    hypothesis: '因果闭环证据已具备（回切复现 / 双向开闭 / 同环境重编二进制一致）：该结论可从"未发现反例"提升为"已证明"'
+    minEvidence: 1
+    strong: true
+    relevance: '三级置信度的"已证明"门槛：仅有相关性或"改了就好了"不足以称已证明'
+    fix: null

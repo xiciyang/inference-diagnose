@@ -1,0 +1,40 @@
+id: mindie
+kind: framework
+displayName: MindIE
+version: 1
+requires:
+  hardware: [ascend-arm]
+probes:
+  - id: mindie-log
+    section: mindie-log
+    command: "tail -n 500 /var/log/mindie/mindie_server.log"
+  - id: npu-status
+    section: npu-status
+    command: "npu-smi info"
+  - id: serving-args
+    section: serving-args
+    command: "P=$(pgrep -f 'mindie|vllm|python' | head -1); echo \"DSH-SIGNAL proc.pid=${P:-none}\"; [ -n \"${P:-}\" ] && tr '\\0' '\\\n' < /proc/$P/cmdline | head -40; [ -n \"${P:-}\" ] && tr '\\0' '\\\n' < /proc/$P/environ 2>/dev/null | grep -Ei 'ASCEND|HCCL|PRECISION|QUANT|ROPE|MAX_|WORLD|RANK|TP_|CACHE|SPEC|DTYPE' | head -40"
+  - id: model-config
+    section: model-config
+    command: "for f in $(timeout 30 find \"${MODEL_DIR:-/}\" -maxdepth 6 -name config.json -path '*model*' 2>/dev/null | head -3); do echo \"--- model-config: $f\"; grep -Eo '\"(model_type|torch_dtype|max_position_embeddings|rope_theta|rope_scaling|vocab_size|hidden_size|num_hidden_layers|num_attention_heads|num_key_value_heads|tie_word_embeddings|quant_method|load_in_8bit|load_in_4bit|num_local_experts|num_experts_per_tok)\"[^,}]*' \"$f\" | head -30; done"
+  - id: model-weights
+    section: model-weights
+    command: "for d in $(timeout 30 find \"${MODEL_DIR:-/}\" -maxdepth 6 -name '*.safetensors.index.json' -o -maxdepth 6 -name 'pytorch_model.bin.index.json' 2>/dev/null | head -2 | xargs -r -n1 dirname | sort -u); do echo \"--- weights-dir: $d\"; ls -l \"$d\" | head -25; echo \"DSH-SIGNAL weights.shards_declared=$(grep -o '\"[^\"]*\\.safetensors\"' \"$d\"/*.index.json 2>/dev/null | sort -u | wc -l)\"; echo \"DSH-SIGNAL weights.shards_present=$(ls \"$d\"/*.safetensors 2>/dev/null | wc -l)\"; ls \"$d\" | grep -Ei 'scale|quant|zero|amax|kv_scale' | head -10; done"
+  - id: tokenizer-fingerprint
+    section: tokenizer-fingerprint
+    command: "for f in $(timeout 30 find \"${MODEL_DIR:-/}\" -maxdepth 6 \\( -name tokenizer.json -o -name tokenizer_config.json -o -name vocab.json -o -name merges.txt -o -name special_tokens_map.json \\) 2>/dev/null | head -6); do echo \"--- tokenizer-file: $f\"; sha256sum \"$f\"; done; timeout 15 find / -maxdepth 6 -name tokenizer_config.json 2>/dev/null | head -1 | xargs -r grep -Eo '\"(tokenizer_class|model_max_length|add_bos_token|add_eos_token|clean_up_tokenization_spaces)\"[^,}]*' | head -10"
+  - id: quality-probe
+    section: quality-probe
+    command: "EP=\"${MINDIE_ENDPOINT:-http://127.0.0.1:1025/v1/chat/completions}\"; M=\"${MODEL_NAME:-default}\"; ask(){ timeout 90 curl -s \"$EP\" -H 'Content-Type: application/json' -d \"{\\\"model\\\":\\\"$M\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":$1}],\\\"temperature\\\":0,\\\"max_tokens\\\":48,\\\"seed\\\":7}\" 2>&1 | tr -d '\\\n' | tail -c 600; }; A=$(ask '\"用一句话说明什么是张量并行。\"'); B=$(ask '\"用一句话说明什么是张量并行。\"'); echo \"--- temp0-run1: $A\"; echo \"--- temp0-run2: $B\"; case \"$A\" in *'\"choices\"'*) if [ \"$A\" = \"$B\" ]; then echo \"DSH-SIGNAL quality.deterministic=true\"; else echo \"DSH-SIGNAL quality.deterministic=false\"; fi;; *) echo \"DSH-SIGNAL quality.probe=endpoint-unreachable (响应无 choices，不下确定性结论)\";; esac; LONG=$(for i in $(seq 1 600); do printf '这是一段用于填充上下文的文本。'; done); echo \"DSH-SIGNAL longctx.chars=${#LONG}\"; C=$(ask \"\\\"请只回答一个字：好。忽略以下重复字符。$LONG\\\"\"); echo \"--- longctx: $C\""
+  - id: precision-log
+    section: precision-log
+    command: "for L in /var/log/mindie/mindie_server.log /var/log/mindie/*.log /root/mindie*.log; do [ -f \"$L\" ] && { echo \"--- precision-log: $L\"; grep -Ei 'fallback|precision|overflow|nan|inf|aclnn|aicore|invalid|unsupported' \"$L\" | tail -n 60; }; done"
+  - id: perf-snapshot
+    section: perf-snapshot
+    command: 'EP="${VLLM_BASE:-http://127.0.0.1:8000}"; ME="${MINDIE_ENDPOINT:-}"; [ -n "$ME" ] && EP="${ME%/v1/chat/completions}"; M="${MODEL_NAME:-}"; [ -z "$M" ] && M=$(timeout 10 curl -s --connect-timeout 3 --max-time 8 "$EP/v1/models" 2>/dev/null | grep -o "\"id\":\"[^\"]*\"" | head -1 | cut -d"\"" -f4); if [ -z "$M" ]; then echo "DSH-SIGNAL perf.unavailable=true (端点无 /v1/models 响应：未测到任何性能指标，不臆断)"; else CH="$EP/v1/chat/completions"; P="[{\"role\":\"user\",\"content\":\"用一句话说明什么是张量并行。\"}]"; echo "DSH-SIGNAL perf.model=$M"; echo "DSH-SIGNAL perf.max_tokens=64"; T0=$(date +%s%3N); R=$(timeout 120 curl -s --connect-timeout 3 --max-time 90 "$CH" -H "Content-Type: application/json" -d "{\"model\":\"$M\",\"messages\":$P,\"temperature\":0,\"max_tokens\":64,\"seed\":7}" 2>&1); if [ "$(printf "%s" "$R" | grep -c "choices")" = "0" ]; then echo "DSH-SIGNAL perf.unavailable=true (端点响应无 choices：**未做任何计时/计数**，不臆断)"; else T1=$(date +%s%3N); E2E=$((T1-T0)); echo "DSH-SIGNAL perf.e2e_ms=$E2E"; CT=$(printf "%s" "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);u=d.get(\"usage\") or {};print(u.get(\"completion_tokens\",\"\"))" 2>/dev/null); [ -n "$CT" ] && echo "DSH-SIGNAL perf.completion_tokens=$CT"; FT=""; timeout 90 curl -s -N --connect-timeout 3 --max-time 80 "$CH" -H "Content-Type: application/json" -d "{\"model\":\"$M\",\"messages\":$P,\"temperature\":0,\"max_tokens\":64,\"stream\":true,\"seed\":7}" 2>/dev/null | while IFS= read -r L; do if [ -z "$FT" ]; then case "$L" in *content*) FT=$(date +%s%3N); echo "DSH-SIGNAL perf.ttft_ms=$((FT-T0))";; esac; fi; done; fi; MM=$(timeout 20 curl -s --connect-timeout 3 --max-time 15 "$EP/metrics" 2>/dev/null); if [ -n "$MM" ]; then KV=$(printf "%s" "$MM" | grep -m1 "^vllm:gpu_cache_usage_perc" | grep -o "[0-9.]*$"); [ -n "$KV" ] && echo "DSH-SIGNAL perf.kv_cache_usage=$KV"; PH=$(printf "%s" "$MM" | grep -m1 "^vllm:prefix_cache_hits_total" | grep -o "[0-9.]*$"); PQ=$(printf "%s" "$MM" | grep -m1 "^vllm:prefix_cache_queries_total" | grep -o "[0-9.]*$"); [ -n "$PH" ] && [ -n "$PQ" ] && [ "$PQ" != "0" ] && python3 -c "print(\"DSH-SIGNAL perf.prefix_cache_hit_rate=%.4f\" % ($PH/$PQ))"; NP=$(printf "%s" "$MM" | grep -m1 "^vllm:num_preemptions_total" | grep -o "[0-9.]*$"); [ -n "$NP" ] && echo "DSH-SIGNAL perf.num_preemptions=$NP"; else echo "DSH-SIGNAL perf.metrics=unavailable"; fi; fi; true'
+ruleRefs:
+  - root-causes/framework-mindie-rules.yaml
+  - root-causes/quality-gibberish-rules.yaml
+  - root-causes/output-anomaly-rules.yaml
+envHints:
+  logDir: "/var/log/mindie"

@@ -1,0 +1,99 @@
+id: consistency-environment-rules
+version: 1
+# ── C 范式（一致性）环境差异路径规则 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# "不能复现"路径：没有可用的多次采样，无法判定非确定性。此时**不臆断**，改为
+# 列出必须逐项比对的环境维度（驱动/固件版本、硬件批次、并发与调度配置），
+# 并显式声明"非确定性在原理上不可判定"。
+rules:
+  - id: rc-cons-env-001
+    when: 'DSH-SIGNAL\s+pkg\.|driver|firmware|固件|ascend.*version|npu-smi.*version'
+    signalExample: ['DSH-SIGNAL pkg.torch=2.11.0', 'driver version: 24.1.rc3', 'firmware 7.5.0', '固件版本 7.5.0', 'ascend version 8.0.RC3', 'npu-smi version 24.1.rc3']
+    judgement: contextual
+    hypothesis: '环境差异候选：驱动/固件/软件栈版本不同。偶发问题在"同代码不同版本栈"上表现不同，是最常见的不可复现来源'
+    minEvidence: 1
+    strong: true
+    relevance: '报告已采集版本矩阵（pkg.* / npu-driver-matrix 段）；判据是"出现问题的那次"与"正常的那次"版本是否一致，而不是版本本身新旧'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '把"出问题环境"与"正常环境"的版本矩阵逐项列表比对（驱动 / 固件 / CANN / torch_npu / vllm 或 MindIE / 算子库），任何一项不同都先对齐再复测；不允许只对齐其中一部分'
+      verification: '对齐版本后复测：原现象不再出现（或稳定复现），且版本矩阵逐项相等'
+      rollback: '保留原版本组合的完整清单（报告已留存），可整体回滚'
+      riskLevel: high
+  - id: rc-cons-env-002
+    when: 'npu-smi info -t board|\bboard(?:\s+id)?\s{0,40}[=:]?\s{0,40}[0-9a-fx]|SOC[^a-zA-Z0-9_]{0,3}[0-9a-zA-Z]|chip[^a-zA-Z0-9_]{1,3}[0-9]|批次[:：]|序列号[:：]|SERIAL[=:]|device_count[=:]|rank[=: ]'
+    signalExample: ['npu-smi info -t board', 'Board ID                         0x1a2b', 'SOC 0', 'chip 3', '批次: A1', '序列号: SN12345', 'SERIAL=SN12345', 'device_count=8', 'rank=0']
+    judgement: contextual
+    hypothesis: '环境差异候选：硬件批次/单板差异。同型号不同批次的算子行为可能不同，尤其在低频缺陷（缓存、ECC、时序）上'
+    minEvidence: 1
+    relevance: '报告已采集 NPU 状态与驱动矩阵；判据是同型号的 board/SOC/批次字段是否一致'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '记录两边的板卡标识与批次，优先在"正常环境"的同一张卡上复现同一请求；若仅特定卡复现，按单卡缺陷处理（隔离该卡）'
+      verification: '在同一张卡上复测：现象随卡走（指向硬件）或不随卡走（指向配置/软件）'
+      rollback: '恢复原卡位与调度配置'
+      riskLevel: medium
+  - id: rc-cons-env-003
+    when: 'max-num-seqs|max_num_seqs|tensor-parallel|data-parallel|enable-chunked-prefill|block-size|concurrency|并发|batch'
+    signalExample: ['--max-num-seqs=32', 'max_num_seqs: 256', '--tensor-parallel-size 4', '--data-parallel-size 2', '--enable-chunked-prefill', '--block-size 128', 'concurrency=32', '并发 32', 'batch_size=32']
+    judgement: contextual
+    hypothesis: '环境差异候选：并发与调度配置不同。偶发问题常只在特定批形状/并发度下出现（动态 batching 改变算子形状与数值）'
+    minEvidence: 1
+    strong: true
+    relevance: '报告已留存完整 cmdline；判据是两边的并发/调度参数是否逐项一致（含 --max-num-seqs、--max-num-batched-tokens、--block-size、DP/TP/EP）'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '把并发与调度参数逐项对齐后复测；若对齐后仍不可复现，按"单请求串行（--max-num-seqs=1）"再测一次，用来区分"批形状相关"与"完全随机"'
+      verification: '对齐参数后：原现象在相同并发下稳定复现或稳定消失；--max-num-seqs=1 的结果作为对照组记录'
+      rollback: '恢复原并发参数（报告已留存 cmdline）'
+      riskLevel: medium
+  - id: rc-cons-env-004
+    when: 'vllm_ascend|vllm-ascend|VLLM_USE_V1|in_container\.(vllm|torch)|空构建|dev\d+|empty'
+    signalExample: ['import vllm_ascend', 'vllm-ascend 0.9.1', 'VLLM_USE_V1=1', 'DSH-SIGNAL in_container.vllm=0.23.1', '空构建镜像', 'dev223+ga346d589f', 'empty response']
+    judgement: contextual
+    hypothesis: '环境差异候选：软件栈中混入了非发布版本（dev/源码构建/`+empty` 本地版本号）——同一份代码在不同构建下的算子实现可能不同，且不可复现'
+    minEvidence: 1
+    relevance: '版本字符串里出现 dev / local 构建标记时，必须与正常环境的构建来源逐项核对（同编译环境重编未改源码，二进制 SHA256 应一致）'
+    # 因果闭环门槛（§6.2 能力④）：本规则提出的是一条**待比对确认的成因**，
+    # 没有"双向开闭 / 回切复现 / 二进制一致"这类闭环证据时，置信度**不得**升到"已证明"
+    # （"改了就好了"不算因果）。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '用官方发布版本替换本地/dev 构建；若必须用本地构建，记录构建环境与产物 SHA256，并在两边使用同一二进制'
+      verification: '替换后复测：现象消失；且两边二进制 SHA256 一致（排除编译混淆）'
+      rollback: '保留原构建产物与版本号'
+      riskLevel: high
+  - id: rc-cons-env-005
+    when: 'DSH-SIGNAL\s+(vllm\.proc\.pid=none|vllm\.container=unavailable|metrics\.unavailable=true|engine_log=unavailable)'
+    signalExampleExempt: 'when 匹配 vllm.proc.pid=none / vllm.container=unavailable / metrics.unavailable=true / engine_log=unavailable，声明"环境证据取不到"'
+    judgement: contextual
+    hypothesis: '环境指纹缺口声明：本报告没有取得进程/容器/指标端点信息，因此"环境差异"这一整类假设**在原理上不可判定**——需先补齐指纹再比对'
+    minEvidence: 1
+    strong: true
+    relevance: '防止把"没采到环境信息"当成"环境无差异"；恢复方式是按 README 在宿主机（而非容器内）重跑采集脚本'
+    fix: null
+  - id: rc-cons-env-006
+    when: 'DSH-SIGNAL\s+evidence\.missing\.'
+    signalExampleExempt: 'when 匹配 DSH-SIGNAL evidence.missing.*，是通用证据缺口声明'
+    judgement: contextual
+    hypothesis: '证据缺口声明（通用）：本报告缺少判定一致性所需的证据，相关假设在原理上不可判定'
+    minEvidence: 1
+    relevance: '与 rc-cons-env-005 互补，覆盖其它缺口'
+    fix: null

@@ -1,0 +1,32 @@
+=== quality-probe ===
+--- cmd: probe-quality-probe
+DSH-SIGNAL quality.model=
+--- temp0-run1(core): 
+--- temp0-run2(core): 
+DSH-SIGNAL quality.probe=endpoint-unreachable (响应无 choices)
+=== end:quality-probe ===
+=== quality-sweep ===
+--- cmd: probe-quality-sweep
+DSH-SIGNAL quality.sweep.n=8 model= max_tokens=512 metrics_snapshot_sum_before=0
+DSH-SIGNAL quality.sample.1=n/a (响应不可解析：**不下结论**，不用空串哈希冒充样本指纹)
+DSH-SIGNAL quality.sample.2=n/a (响应不可解析：**不下结论**，不用空串哈希冒充样本指纹)
+DSH-SIGNAL quality.sweep.valid=0/8 (有效样本数：n/a 的不是样本，不能计入一致性判定)
+DSH-SIGNAL quality.sweep.done=true（core_hash 仅覆盖 content/reasoning/finish；snapshot 用于把异常样本与调度/缓存计数关联）
+=== end:quality-sweep ===
+=== logits-probe ===
+--- cmd: probe-logits-probe
+DSH-SIGNAL logits.model=
+DSH-SIGNAL logits.salt_supported=0
+--- [路径1 完整重算#1 salt=probeA-1] <无法解析：{"detail":"Not Found"}> 耗时0s
+--- [路径3 换salt完整重算#2] <无法解析：{"detail":"Not Found"}> 耗时0s
+DSH-SIGNAL logits.prefill_repeat_consistent=n/a (端点未返回可解析的 logprobs：**不下结论**，不把失败当成漂移)
+=== end:logits-probe ===
+=== perf-snapshot ===
+--- cmd: probe-perf-snapshot
+DSH-SIGNAL perf.unavailable=true (端点无 /v1/models 响应：未测到任何性能指标，不臆断)
+=== end:perf-snapshot ===
+=== evidence-gaps ===
+--- cmd: probe-evidence-gaps
+DSH-SIGNAL evidence.missing.0=metrics_endpoint（/metrics 不可达 → 无法用指标做时间/计数关联）
+DSH-SIGNAL evidence.missing.1=client_request_params（服务未开 --enable-log-requests）
+=== end:evidence-gaps ===

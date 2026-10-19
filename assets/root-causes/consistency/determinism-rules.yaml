@@ -1,0 +1,112 @@
+id: consistency-determinism-rules
+version: 1
+# ── C 范式（一致性）复现路径规则 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# "能复现"路径：报告里存在同一输入的多次采样指纹（quality.sample.N / quality.deterministic /
+# logits.prefill_repeat_consistent / tokenizer.roundtrip_ok）。判据全部来自**已采集的数值信号**，
+# 不做完整复现测试框架（用户 2026-09-28 裁决：最小可用实现）。
+rules:
+  - id: rc-cons-001
+    when: 'quality\.sample\.\d+=core_hash:\w+\s+\{[^}]*"finish":"?"?length"?'
+    signalExample: 'DSH-SIGNAL quality.sample.1=core_hash:a1b2c3d4 {"c":"x","c_len":1,"r_len":0,"finish":"length"}'
+    judgement: decisive
+    decisiveRationale: '命中的是采样记录里的 `finish` 字段取值 `length`（`quality.sample.N=core_hash:… {"finish":"length"}`）：这是该次采样**被 max_tokens 截断**的直接记录。截断位置不同的样本指纹必然不同，故该取值单行即足以判定"指纹差异可由截断解释"。'
+    requires:
+      - when: 'quality\.sample\.'
+    hypothesis: '同一输入多次采样中出现被 max_tokens 截断的样本：所谓"不一致"可能只是截断位置不同，**不是非确定性**——必须先排除这一整类假阳性'
+    minEvidence: 1
+    strong: true
+    relevance: '判据来自报告里每次采样的 finish 字段；只要出现 length 截断，指纹差异就不能作为非确定性证据'
+    fix:
+      code: '把客户端 max_tokens 提高到足以自然结束（或统一截断口径）后重新采样；确认所有样本 finish=stop 再判定一致性'
+      verification: '提高 max_tokens 后重采 N=20：全部 finish=stop，且指纹仍不一致才可判非确定性'
+      rollback: '恢复原 max_tokens（本项只改采样参数，不影响服务）'
+      riskLevel: low
+  - id: rc-cons-002
+    when: 'quality\.deterministic=false'
+    signalExample: 'DSH-SIGNAL quality.deterministic=false'
+    judgement: decisive
+    decisiveRationale: '同 rc-qg-003：命中的是 `quality.deterministic=false`——探针以 temp=0+固定 seed 自动比对两次输出的结果字段，单行即指向非确定性计算路径。'
+    hypothesis: '同 temp=0（同 seed）两次输出不一致：指向非确定性计算路径（算子 reduce 顺序、并行通信、KV/前缀缓存复用、动态 batching 串味），而不是采样随机性'
+    minEvidence: 1
+    strong: true
+    needsProbes: [quality-probe, effective-config]
+    relevance: '判别信号已由探针自动比对；命中即"能复现"路径成立，可先排除"采样参数"这一整类假设'
+    fix:
+      mode: partial
+      code: pending
+      note: '需二分定位：① 关闭 prefix caching / 动态 batching（--max-num-seqs=1）复测；② 降为单卡 TP=1 复测；③ 固定算子精度模式。每一步的差异即根因所在'
+      verification: '每次改动后同 prompt 连跑 5 次：输出逐字一致且指纹单一'
+      rollback: '每次仅改一项并记录原值，可逐项回滚'
+      riskLevel: medium
+  - id: rc-cons-003
+    when: 'logits\.prefill_repeat_consistent=false'
+    signalExample: 'DSH-SIGNAL logits.prefill_repeat_consistent=false'
+    judgement: decisive
+    decisiveRationale: '命中的是 `logits.prefill_repeat_consistent=false`：探针跑"完整重算#1 → 同 salt 命中 → 换 salt 完整重算#2"三条路径并比对首 token logprob，false 表示**两次完整重算不一致**，即误差产生在采样之前的 prefill/地址路径上。该字段是探针实测比对的结论，单行即足够。'
+    hypothesis: '两次**完整重算**（不同 cache_salt）的首 token logprob 不同：误差产生在采样之前的 prefill/地址路径上，比文本层面的"乱码/不一致"强得多的判据'
+    minEvidence: 1
+    strong: true
+    needsProbes: [logits-probe, index-address-probe]
+    relevance: '文本不一致有无穷种表现、不可比；首 token logprob 是唯一确定的数值目标，且 max_tokens=1 已把前向与自回归解耦'
+    fix:
+      mode: partial
+      code: pending
+      note: '按"逐层二分"补采：对 embedding 与每层 hidden state 做余弦相似度，找首个误差放大点；再对该层的离散决策点（索引/分页地址）做可算判据审计'
+      verification: '修复后同样三路径复测：prefill_repeat_consistent=true，且逐层余弦相似度全线 ≥0.999'
+      rollback: '保留算子二进制与源码版本，可按版本回切'
+      riskLevel: high
+  - id: rc-cons-004
+    when: 'tokenizer\.roundtrip_ok=false'
+    signalExample: 'DSH-SIGNAL tokenizer.roundtrip_ok=false'
+    judgement: decisive
+    decisiveRationale: '命中的是 `tokenizer.roundtrip_ok=false`——探针已实跑 tokenize→detokenize 往返并比对原文，false 是**往返失败**的实测结论；映射无损时往返必然成功。'
+    hypothesis: 'tokenizer 往返不一致（tokenize → detokenize 无法还原）：token 与文本映射本身就有损，说明 tokenizer 与权重不同源或词表被替换——这会让输出"看起来像不一致"，实为映射错位'
+    minEvidence: 1
+    strong: true
+    relevance: '往返是"若真则必见"的判据：tokenizer 正常时往返必然成功'
+    fix:
+      code: '用模型发布包内的 tokenizer 全套文件整体替换（tokenizer.json / tokenizer_config.json / special_tokens_map.json / vocab / merges），禁止与其它模型混用；核对 config.vocab_size 与词表实际大小一致'
+      verification: '对固定中英混排文本再次往返：完全还原；再跑 temp=0 固定 prompt 语义正确'
+      rollback: '保留原 tokenizer 目录 tar 包与 sha256，失败整体回滚'
+      riskLevel: medium
+  - id: rc-cons-005
+    when: 'DSH-SIGNAL\s+quality\.probe=endpoint-unreachable|DSH-SIGNAL\s+tokenizer\.roundtrip=n/a'
+    signalExampleExempt: 'when 匹配 quality.probe=endpoint-unreachable / tokenizer.roundtrip=n/a，声明"端点不可达或往返不可测 ⇒ 无法做一致性判定"'
+    judgement: contextual
+    hypothesis: '证据缺口声明：端点不可达，本次**没有**取得可判定一致性的采样，因此"是否非确定"在原理上不可判定（不是"未发现反例"）'
+    minEvidence: 1
+    relevance: '防止把"没采到"当成"没问题"；恢复方式是修好端点/网络后重跑采集'
+    fix: null
+  - id: rc-cons-006
+    when: 'DSH-SIGNAL\s+quality\.sweep\.done=true'
+    signalExample: 'DSH-SIGNAL quality.sweep.done=true (8/8 有效样本)'
+    judgement: contextual
+    requires:
+      - when: 'quality\.sample\.'
+    hypothesis: '批量采样已完成：可用"异常比率"（而非单次结果）判断一致性问题的存在性与修复效果'
+    minEvidence: 1
+    relevance: '批量采样是偶发类问题唯一可靠的判据来源：单次正常不代表不存在'
+    fix: null
+  - id: rc-cons-007
+    # ── 数据驱动规则槽（derivedBy）──
+    # 本条的 when 只用于"该规则属于确定性轨道"的可读性，**判定不用它**：
+    # 聚合判据（多条采样指纹的去重计数）无法用单行正则表达，由
+    # src/primitives/consistency-rules.js#determinismVerdictCandidates 填数。
+    # 规则文件仍是 hypothesis / fix / needsProbes 的**唯一真源**（代码里不写领域文案）。
+    derivedBy: samples-distinct
+    when: 'DSH-SIGNAL\s+quality\.sample\.\d+=core_hash:'
+    signalExample: 'DSH-SIGNAL quality.sample.3=core_hash:e5f6a7b8 {"c":"y","c_len":1,"r_len":0,"finish":"stop"}'
+    judgement: quantitative
+    hypothesis: '同一输入多次采样的输出指纹不一致：**可复现地**检出非确定性（同 temp=0 同 seed，故不是采样随机性）'
+    minEvidence: 1
+    strong: true
+    needsProbes: [quality-sweep, logits-probe]
+    relevance: '判据是"指纹去重计数 > 1"；若样本里出现 finish=length 截断，则差异可由截断解释，本条**不得**作为非确定性证据（先排除假阳性）'
+    fix:
+      mode: partial
+      code: pending
+      note: '按"控制变量四件套"二分：① 同一 DP + 同 cache_salt 完整重算两次（排除运行历史/缓存路径）；② --max-num-seqs=1 单请求串行（排除动态 batching 串味）；③ 关闭 prefix caching（排除缓存复用污染）；④ 降为 TP=1 单卡（排除并行通信 reduce 顺序）。每一步的差异即根因所在'
+      verification: '每次改动后同 prompt 连跑 5 次：输出逐字一致且指纹去重计数 = 1；再用批量采样 SAMPLE_N=20 确认异常比率为 0'
+      rollback: '每次仅改一项并记录原值，可逐项回滚（报告已留存完整 cmdline）'
+      riskLevel: medium

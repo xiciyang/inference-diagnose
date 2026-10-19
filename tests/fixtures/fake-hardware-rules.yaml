@@ -1,0 +1,17 @@
+id: fake-hardware-rules
+version: 1
+appliesTo:
+  hardware: fake-hardware
+rules:
+  - id: rc-fake-001
+    judgement: contextual   # 外部维度同样必须声明判据分级（docs/judgement-rubric.md §4 G1）
+    when: "XERR 0xDEAD"
+    hypothesis: "未知硬件返回 XERR 0xDEAD（P0 正向断言夹具）"
+    minEvidence: 1
+    strong: true
+    relevance: "夹具探针输出中的错误码，用于验证"未知维度"能走完整条链路"
+    fix:
+      code: "重置该硬件并复核 XERR 计数器（夹具动作）"
+      verification: "复跑夹具探针：XERR 计数不再增长"
+      rollback: "回滚到上一版硬件配置快照"
+      riskLevel: low

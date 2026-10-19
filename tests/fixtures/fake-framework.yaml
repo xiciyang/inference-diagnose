@@ -1,0 +1,14 @@
+id: fake-framework
+kind: framework
+displayName: P0 正向断言夹具（源码中从未出现过的框架）
+version: 1
+requires:
+  hardware: [fake-hardware]
+probes:
+  - id: fake-framework-log
+    section: fake-framework-log
+    command: "echo 'FAKEFW: boot ok'"
+ruleRefs:
+  - root-causes/fake-hardware-rules.yaml
+envHints:
+  note: 仅用于 no-brand-in-core 正向断言

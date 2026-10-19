@@ -1,0 +1,92 @@
+id: hardware-nvidia-rules
+version: 1
+# NVIDIA CUDA 硬件根因规则簇 —— 2026-09-28 长任务 1 / A1 新增（纯数据，L1 热加载）。
+#
+# 覆盖"CUDA 卡侧硬件的既成事实"与"驱动/NVML 不可用"两类：
+#   既成事实（decisive）：设备掉总线、不可纠正 ECC —— 单行即足够，原因是内核/驱动
+#     只会在这两件**已经发生**的事上打印这些固定字面量；
+#   需交叉核对（contextual）：Xid 错误码（含义依码而异，必须查码表）、NVML 初始化失败
+#     （容器未挂驱动 / 驱动未加载 / 权限不足，形态多样）、CUDA OOM（需结合显存容量与配置）。
+#
+# 为什么规则只吃"证据原文"而不吃信号字段：本规则族的 when 全部匹配
+# nvidia-smi / dmesg 的**原始输出**，这样探针改写格式也不会让规则静默失效
+# （门禁 G6b 会对每条 when 的正例做逐分支覆盖，正是防这一点）。
+# 被 gb10 / nvidia 两个硬件维度共同引用（ruleFiles 是集合，天然去重）。
+appliesTo:
+  hardware: [nvidia, gb10]
+rules:
+  - id: rc-nv-001
+    when: 'GPU has fallen off the bus'
+    signalExample: 'NVRM: GPU has fallen off the bus (this may be a hardware failure)'
+    judgement: decisive
+    decisiveRationale: '命中的是内核 NVRM 驱动打印的固定字面量 `GPU has fallen off the bus`：它表示设备已从 PCIe 总线上消失、驱动再也无法与卡通信。这是**既成事实**（设备已不可达），不是诱因也不是推断，且其它规则与探针都不会产出该串，故单行即足够。'
+    hypothesis: 'GPU 已从 PCIe 总线脱落（驱动失联）——推理进程随后必然报 CUDA/NVML 错误，或被宿主杀死而表现为"服务突然消失"'
+    minEvidence: 1
+    strong: true
+    relevance: '内核态固定字面量，与"进程自己崩"在措辞上完全可区分：出现它说明是**卡先没了**，不是模型代码错'
+    fix:
+      code: '先记下板卡身份再报修：nvidia-smi -q 的 GPU Serial / PCI Bus ID；期间用 CUDA_VISIBLE_DEVICES 把服务迁到健康卡；若单卡机型则停服等修，不要反复重启期望自愈'
+      verification: '迁移/修复后压测 30 分钟：nvidia-smi 查询稳定（不掉卡），dmesg 无新增 fallen off the bus 与 Xid 记录'
+      rollback: '恢复原 CUDA_VISIBLE_DEVICES 与容器卡映射（原值已随报告留存）'
+      riskLevel: high
+  - id: rc-nv-002
+    when: 'Xid[ :=][0-9]+|NVRM: Xid'
+    signalExample: ['Xid 79', 'NVRM: Xid (PCI:0000:01:00): 79', 'Xid 48']
+    judgement: contextual
+    hypothesis: 'NVIDIA 驱动报出 Xid 错误：Xid 必须**按码查表**才有意义（13/31/43/45/48/74/79 等各指不同成因，含显存访问越界、掉总线、ECC、驱动内部错误）；单看到 Xid 字样不足以判定成因'
+    minEvidence: 1
+    needsProbes: [nv-xid]
+    relevance: '当前只采到 dmesg 尾部 120 行的 Xid 原文，缺该码的官方释义与发生频次；需先查码表再定修复动作'
+    fix:
+      mode: partial
+      code: pending
+      note: '按报告中的 Xid 码查官方 Xid 表：79 多指 GPU 掉总线（与 rc-nv-001 同族，应合并看）；48 常指显存访问越界（多为应用/内核 bug 而非卡坏）；13/31 多为驱动内部错误。查表后再选修复动作，不要凭码号大小推断严重度'
+      verification: '按码表选定动作后复测：同一负载下 dmesg 在观察窗口内不再出现该 Xid 码'
+      rollback: '保留原驱动版本与启动参数（报告已留存 nvidia-smi -q 与 /proc/driver/nvidia/version）'
+      riskLevel: medium
+  - id: rc-nv-003
+    # 2026-09-28 真机取证（GB10，nvidia-smi 580.126.09）：`-q -d ECC` 的真实字段名是
+    #   `DRAM Uncorrectable` / `SRAM Uncorrectable Parity` / `SRAM Uncorrectable SEC-DED`，
+    #   而 `nvidia-smi` 概览表的**列头**恰好写作 `Volatile Uncorr. ECC`。
+    # 两条由此固化的判据：
+    #   ① 必须匹配**带非零取值**的计数行（`: [1-9]`），否则本机每次都会以 `: N/A` 命中 ——
+    #      那是"该机型没有 ECC"的正常态，不是故障（已知阴性对照）；
+    #   ② **不得**匹配 `Volatile Uncorr. ECC` 列头 —— 它在健康机器的每一张 nvidia-smi 表里都有，
+    #      命中它等于每条报告都报一次硬件故障（这正是 G4 要防的"命中工具自身标签"）。
+    when: 'DRAM Uncorrectable\s*:\s*[1-9]|SRAM Uncorrectable[^:]*:\s*[1-9]|Uncorrectable ECC'
+    signalExample: ['DRAM Uncorrectable                         : 3', 'SRAM Uncorrectable Parity                  : 2', 'Uncorrectable ECC detected on device 0']
+    judgement: decisive
+    decisiveRationale: '命中的是 ECC 计数器里**带非零取值**的不可纠正计数行（`DRAM Uncorrectable` / `SRAM Uncorrectable …` 后跟 `: [1-9]`）：可纠正错误在 nvidia-smi 里的字段名是 `Corrected`，不会带 "Uncorrectable" 字样；而 `: N/A` 表示该机型未启用 ECC 计数（本机 GB10 即如此），故判据要求取值非零。非零的不可纠正计数直接表示**不可恢复的显存/缓存错误已发生**，是既成事实而非诱因，单行即足够。'
+    hypothesis: 'GPU 显存出现不可纠正 ECC 错误：受影响的那次前向计算可能已产出错误结果（服务不一定崩，但输出可能已错）'
+    minEvidence: 1
+    strong: true
+    relevance: '不可纠正 ECC 是硬件级故障，同时解释"崩溃"与"不崩但输出错"两种表象；需与 rc-nv-002 的 Xid 区分（后者待查表）'
+    fix:
+      code: '隔离该卡并走硬件报修（记录 nvidia-smi -q 的 GPU Serial / PCI Bus ID）；期间把服务迁到健康卡。注意：迁移**不会**修正已经产出的错误结果，需重跑受影响批次'
+      verification: '迁移后压测 30 分钟：Volatile Uncorrectable 计数保持 0，且同一 temp=0 prompt 连跑 3 次逐字一致'
+      rollback: '恢复原卡槽与 CUDA_VISIBLE_DEVICES 映射'
+      riskLevel: high
+  - id: rc-nv-004
+    when: 'Driver/library version mismatch|Failed to initialize NVML'
+    signalExample: ['Driver/library version mismatch detected after kernel upgrade', 'nvidia-smi: Failed to initialize NVML: Unknown Error']
+    judgement: contextual
+    hypothesis: '驱动与用户态库（或容器内可见的驱动）不一致 / NVML 不可用：宿主机刚升级过内核或驱动而用户态未同步，或容器启动时没有把驱动设备与能力挂进来'
+    minEvidence: 1
+    relevance: '两种成因（版本错配 / 容器未挂 --gpus 或 --device=/dev/nvidia*）在报告里可区分：前者带 `version mismatch`，后者只有 `Failed to initialize NVML` 且 nv.smi.available=false'
+    fix:
+      code: '版本错配：重启到与新内核匹配的驱动（或回退内核），不要在服务运行中热换驱动；容器未挂驱动：给容器加 --gpus all（或显式挂 /dev/nvidia* 与 nvidia_uvm），并确认 nvidia-container-toolkit 已装'
+      verification: '容器内执行 nvidia-smi：能列出设备且驱动版本与宿主一致；再跑一次最小前向（python -c 里 cuda tensor 相加）'
+      rollback: '恢复原容器启动参数；驱动回退前先卸载现存服务以避免半升级状态'
+      riskLevel: medium
+  - id: rc-nv-005
+    when: 'CUDA out of memory'
+    signalExample: 'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB'
+    judgement: contextual
+    hypothesis: '显存不足：--gpu-memory-utilization 定得过高（含与其它进程共卡）、--max-model-len / --max-num-seqs 过大导致 KV cache 申请超出，或权重加载阶段就超出（量化配置与显存不匹配）'
+    minEvidence: 1
+    relevance: '需与 nv.memory.total 与并发配置交叉核对才能区分"配置过大"与"卡被别的进程占了"；报告已采集 nvidia-smi 与启动参数'
+    fix:
+      code: '先降 KV/批处理侧：--max-model-len 减半、--max-num-seqs 降到 8 以下，再降 --gpu-memory-utilization（统一内存机型上尤其要留宿主余量）；复测仍 OOM 则查是否共卡（nvidia-smi --query-compute-apps）'
+      verification: '修改后以同一 prompt 长度压测：不再出现 OOM，且 /metrics 的 gpu_cache_usage 稳定在 90% 以下'
+      rollback: '恢复原启动参数（报告已留存完整 cmdline 与 env）'
+      riskLevel: medium

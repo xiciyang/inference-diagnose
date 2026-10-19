@@ -1,0 +1,57 @@
+id: collect-script
+version: 4
+# 采集脚本模板（L1 数据）。占位符：
+#   {{SHIM}}        脱敏函数定义（由 script-composer 从 assets/rules 生成）
+#   {{PROBE_BLOCKS}} 各探针的输出块（每块自带 BEGIN/END 段标记，先脱敏后写文件）
+#   {{HEADER}}      头部信息（三维组合 + 生成时间 + 规则版本）
+# 设计要点：
+#   ① 报告文件在用户服务器侧即已脱敏（明文从不落盘）。
+#   ② 进度走 stderr（不进报告）：v1 只有结束时一行输出，导致"看起来卡死"（2026-09-23 实测缺陷）。
+#   ③ 每段打印耗时，慢段（>=60s）额外提示，便于区分"在跑"与"卡住"。
+shell: bash
+template: |
+  #!/usr/bin/env bash
+  # {{HEADER}}
+  set -uo pipefail
+  OUT="${1:-./collect-report.txt}"
+  : > "$OUT"
+
+  # ---------- 脱敏函数（内嵌规则，不使用外部依赖） ----------
+  {{SHIM}}
+
+  TOTAL=$(grep -c '^emit ' "$0" 2>/dev/null || echo '?')
+  N=0
+  T0=$(date +%s)
+  echo "[$(date +%H:%M:%S)] 开始采集：共 ${TOTAL} 个探针 → ${OUT}" >&2
+  echo "        正常总耗时约 1–3 分钟；探针均有 timeout 上限，慢段会单独提示。" >&2
+  echo "        进度行写在终端（stderr），不会进报告文件。" >&2
+
+  emit() {
+    # $1=section  $2=command
+    local sec="$1"; shift
+    local cmd="$*"
+    local t0=$(date +%s)
+    N=$((N+1))
+    printf '[%s] (%s/%s) 采集中 %s ...\n' "$(date +%H:%M:%S)" "$N" "$TOTAL" "$sec" >&2
+    printf '        cmd: %s\n' "$cmd" >&2
+    {
+      # 2026-09-23 实测缺陷修复：原先段头与 `--- cmd:` 行**未过脱敏管道**，
+      # 探针命令里的默认端点/主机名会原样落盘（被插件二次校验当场拒绝：ERR_DESENSITIZE_MISS）。
+      # 现全部经 dsh_desensitize，确保"报告在采集端即已脱敏"这条硬约束无绕过路径。
+      echo "=== ${sec} ===" | dsh_desensitize
+      bash -c "$cmd" 2>&1 | dsh_desensitize
+      echo "=== end:${sec} ===" | dsh_desensitize
+    } >> "$OUT"
+    local t1=$(date +%s); local dt=$((t1-t0))
+    printf '[%s] (%s/%s) 完成 %s（%ss）\n' "$(date +%H:%M:%S)" "$N" "$TOTAL" "$sec" "$dt" >&2
+    if [ "$dt" -ge 60 ]; then
+      printf '        提示：该段较慢（%ss）。多为 timeout 上限或温度时间序列，可继续等待；\n        若想更快：THERMAL_SAMPLES=2 THERMAL_INTERVAL=5 重跑，或按 README 收紧该探针。\n' "$dt" >&2
+    fi
+  }
+
+  # ---------- 探针 ----------
+  {{PROBE_BLOCKS}}
+
+  T1=$(date +%s)
+  echo "[$(date +%H:%M:%S)] 完成：报告写入 $OUT（本机已脱敏，明文不落盘）；总耗时 $((T1-T0)) 秒。" >&2
+  echo "        请把 $OUT 整份贴回（可先跑 tail -5 确认结尾是 '=== end:kernel-log ==='）。" >&2

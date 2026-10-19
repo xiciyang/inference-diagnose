@@ -1,0 +1,102 @@
+id: regression-accuracy-rules
+version: 1
+# ── B 范式（精度/质量劣化）阈值规则簇 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# baselineType=accuracy 时启用。指标由客户在自己的评测集上产出（本插件不做评测，
+# 只做"客户基线 vs 客户当前值"的对比与归因）。当前值从报告证据行抽取。
+rules:
+  - id: rg-acc-001
+    metric: accuracy
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.accuracy=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.accuracy=0.8120'
+    direction: lower-worse
+    valueDomain: fraction   # C14：期望值域 0–1；>1 视为百分数，先 /100 再比值
+    warnRatio: 1.03
+    criticalRatio: 1.08
+    hypothesis: '评测准确率相对基线下降：量化/精度路径、并行切分、tokenizer 或 chat 模板任一被改动都可能造成系统性精度损失'
+    minEvidence: 1
+    strong: true
+    needsProbes: [precision-log, effective-config]
+    relevance: '基线 accuracy 与当前值的比值（越小越差，已归一化为 >1 表示更差）；注意评测集与解码参数必须同口径'
+    # 因果闭环门槛（§6.2 能力④）：精度下降是**事实**，但"由哪一处改动造成"是**待比对确认的成因**，
+    # 没有 A/B 开闭或回切复现时不得称"已证明"。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '按序排查：① 是否改了 --quantization / kv-cache-dtype / engram 精度（回退到基线配置复测）；② 是否改了 TP/EP/DP 并行度；③ tokenizer 与 chat template 是否与基线同源；④ 是否开了新的图模式/融合算子（ENFORCE_EAGER 对照）'
+      verification: '同一评测集、同一解码参数复测：accuracy 回到基线 -0.5% 以内；且与基线同 prompt 的输出逐字一致率显著回升'
+      rollback: '逐项回滚配置（每次只改一项），保留基线配置快照'
+      riskLevel: high
+  - id: rg-acc-002
+    metric: ppl
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.ppl=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.ppl=8.42'
+    direction: higher-worse
+    warnRatio: 1.03
+    criticalRatio: 1.10
+    hypothesis: '困惑度相对基线上升：语言建模分布发生漂移（精度路径变化或权重加载不完整）'
+    minEvidence: 1
+    needsProbes: [precision-log]
+    relevance: '基线 ppl 与当前值的比值；ppl 对评测文本长度敏感，须同口径'
+    # 因果闭环门槛（§6.2 能力④）：精度下降是**事实**，但"由哪一处改动造成"是**待比对确认的成因**，
+    # 没有 A/B 开闭或回切复现时不得称"已证明"。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '核对权重分片完整性（present == declared）与量化配置；用未量化 bf16 checkpoint 跑同一评测集作为上界对照'
+      verification: '同评测集复测：ppl 回到基线 1.02× 以内'
+      rollback: '回滚量化/权重配置'
+      riskLevel: high
+  - id: rg-acc-003
+    metric: kl_divergence
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.kl_divergence=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.kl_divergence=0.0310'
+    direction: higher-worse
+    warnRatio: 1.50
+    criticalRatio: 3.00
+    hypothesis: '与参考实现的 KL 散度相对基线上升：数值路径偏离参考（算子实现/精度累加/融合顺序变化）'
+    minEvidence: 1
+    needsProbes: [precision-log]
+    relevance: '基线 KL 与当前值的比值；KL 需与参考实现在同一批 prompt 上计算'
+    # 因果闭环门槛（§6.2 能力④）：精度下降是**事实**，但"由哪一处改动造成"是**待比对确认的成因**，
+    # 没有 A/B 开闭或回切复现时不得称"已证明"。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '把当前实例与基线实例固定到同一批 prompt 上比对 logits（首 token top-k），再按算子粒度二分（关闭融合算子 / 切换精度模式）'
+      verification: '同一批 prompt 复测：KL 回到基线 1.2× 以内；首 token top-5 与参考一致率回升'
+      rollback: '逐项回滚算子开关与精度模式'
+      riskLevel: high
+  - id: rg-acc-004
+    metric: exact_match
+    judgement: quantitative
+    pattern: 'DSH-SIGNAL\s+perf\.exact_match=([0-9.]+)'
+    # 规范证据样例（机器校验：pattern 必须能从中抽出数字——见 regression-contract.spec）
+    signalExample: 'DSH-SIGNAL perf.exact_match=0.6420'
+    direction: lower-worse
+    valueDomain: fraction   # C14：期望值域 0–1；>1 视为百分数，先 /100 再比值
+    warnRatio: 1.05
+    criticalRatio: 1.15
+    hypothesis: '精确匹配率相对基线下降：解码参数、模板或末位截断策略变化（如 max_tokens 变小、停止符变化）'
+    minEvidence: 1
+    needsProbes: [effective-config]
+    relevance: '基线 exact_match 与当前值的比值；需确认评测的截断口径一致（否则是口径差异而非模型劣化）'
+    # 因果闭环门槛（§6.2 能力④）：精度下降是**事实**，但"由哪一处改动造成"是**待比对确认的成因**，
+    # 没有 A/B 开闭或回切复现时不得称"已证明"。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '核对客户端 max_tokens / stop / 停止符与模板是否与基线一致；确认评测脚本的截断与后处理未变'
+      verification: '同评测脚本复测：exact_match 回到基线 1.02× 以内'
+      rollback: '恢复解码参数与评测脚本版本'
+      riskLevel: medium

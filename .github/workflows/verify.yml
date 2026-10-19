@@ -1,0 +1,16 @@
+# CI 门禁（P8 接入）：任何 push / PR 都跑四个门禁，任一失败即 FAIL。
+# 门禁 2–4 的脚本位于设计文档仓；未设置 SPEC_ROOT 时显式 SKIP（本仓库不含该仓）。
+# 门禁 5 的兄弟仓同理：未设置 CONTRACTS_ROOT 时显式 SKIP。
+name: verify-gates
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - name: Build
+        run: bash scripts/build.sh
+      - name: Run gates
+        run: bash scripts/verify-all.sh

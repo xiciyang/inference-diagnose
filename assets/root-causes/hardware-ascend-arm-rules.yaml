@@ -1,0 +1,30 @@
+id: hardware-ascend-arm-rules
+version: 1
+appliesTo:
+  hardware: ascend-arm
+rules:
+  - id: rc-ascend-001
+    when: "ECC uncorrectable|Uncorrectable ECC|uncorrectable error"
+    signalExample: ['HBM ECC uncorrectable', 'Uncorrectable ECC detected on device 0', 'uncorrectable error reported by npu-smi']
+    judgement: decisive
+    decisiveRationale: '命中的是 ECC 计数器状态里的 `uncorrectable` 取值（`ECC uncorrectable` / `Uncorrectable ECC`）：corrected/可纠正错误不会带该词，该词直接表示**不可恢复的硬件级错误已发生**。它是既成事实而非诱因，故单行即足够；已收窄正则去掉裸 `HBM ECC`（正常 ECC 日志也会含该字样）。'
+    hypothesis: "NPU HBM 出现不可纠正 ECC 错误，导致推理进程被终止"
+    minEvidence: 1
+    strong: true
+    relevance: "ECC 不可纠正错误是硬件级故障，通常直接对应进程异常退出"
+    fix:
+      code: "隔离该卡并更换 HBM/整卡：npu-smi info -t boardid 记录板卡序列号后走硬件报修流程；期间将服务迁移到健康卡"
+      verification: "迁移后压测 30 分钟：ECC uncorrectable = 0；同期 dmesg 无新增 ECC 记录"
+      rollback: "恢复原卡槽配置（保存 npu-smi 配置与容器卡映射备份）"
+      riskLevel: high
+  - id: rc-ascend-002
+    # 2026-09-23 收紧：原先仅匹配 "temp NNNC" 即推断超温，45C 这类正常读数也会触发（噪声）。
+    # 现要求读数本身超阈（>=85）或出现明确降频/超阈关键词，避免"正常温度"误入根因列表。
+    when: "temp(erature)?[ =:]+(8[5-9]|9[0-9]|[1-9][0-9]{2,})C?|throttl|over.?temp"
+    signalExample: ['temperature: 88C', 'thermal throttling detected', 'over temp alarm', 'thermal throttling active']
+    judgement: contextual
+    hypothesis: "NPU 温度超阈触发降频，可能引发超时或崩溃"
+    minEvidence: 1
+    needsProbes: [npu-thermal-history]
+    relevance: "当前只有瞬时温度，缺时间序列，无法区分持续过热与偶发"
+    fix: null

@@ -1,0 +1,22 @@
+id: runtime-docker-rules
+version: 1
+appliesTo:
+  runtime: docker
+rules:
+  - id: rc-docker-001
+    when: "OOMKilled|[Oo]ut of memory|ExitCode 137|exit code 137|Exited \\(137\\)|shm allocation failed"
+    signalExample: ['"OOMKilled": true', 'Out of memory: Killed process 4242', 'ExitCode 137', 'container exit code 137', 'a1b2c3d4e5f6   vllm-svc    Exited (137) 2 hours ago', 'shm allocation failed: No space left on device']
+    judgement: decisive
+    decisiveRationale: '命中的是容器运行时状态字段 `OOMKilled`、`ExitCode 137` / `Exited (137)`、`Out of memory`、`shm allocation failed`：前者是内核 OOM-killer 的**动作记录本身**，`Exited (137)` 是 `docker ps -a` 对同一事实的原生渲染，`shm allocation failed` 是共享内存分配失败的事实——都是"已被杀 / 已失败"的既成事实，不是诱因。已收窄正则去掉裸 `137` 与裸 `shm`（会命中任意含该数字/字样的行）。'
+    hypothesis: "容器内存/共享内存不足被 OOM 终止（ExitCode 137）"
+    falsifiedBy:
+      - when: 'OOMKilled|[Oo]ut of memory|oom-kill|Killed process|内存不足|shm allocation failed|No space left on device'
+        rationale: '若真为容器内存/SHM 不足，现场必有痕迹：内核动作记录（OOMKilled / oom-kill / Killed process）、运行时或内核自报内存不足（Out of memory / 内存不足）、或 SHM 分配失败（shm allocation failed / No space left on device）。只有 ExitCode 137 而无任何此类痕迹时，137 也可能来自其它 SIGKILL（OOM 之外的强杀、超时清理、人工 kill -9）→ 该假设应被否证'
+    minEvidence: 1
+    strong: true
+    relevance: "容器被 OOM kill 是崩溃的直接原因；需确认是限额过低还是模型侧泄漏。否证条件：全量证据中若无任何 OOM / SHM 不足痕迹，则排除该假设（这是**可判定的否证**，不是「未发现反例」）"
+    fix:
+      code: "提高容器 shm 与内存限额：docker run --shm-size=8g --memory=<按模型峰值上调>；同时核对模型显存/内存占用曲线"
+      verification: "重跑同一负载 30 分钟：无 OOMKilled、ExitCode 非 137"
+      rollback: "恢复原 docker run 参数（配置备份文件）"
+      riskLevel: medium

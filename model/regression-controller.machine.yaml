@@ -1,0 +1,184 @@
+# regression-controller 状态机 —— 单一真源（B 范式：性能劣化诊断）
+#
+# 用户 2026-09-28 裁决：**模式隔离** —— B 不扩展现有 15 态状态机（loop-controller 保持不动），
+# 而是拥有**独立真源 + 独立门禁**。两套状态机共享引擎/脱敏/证据链/会话，但**不共享状态拓扑**。
+#
+# 与 A 的差异（分野）：
+#   A 的输入是"证据"（崩溃现场），B 的输入是"证据 + 客户基线"；
+#   B 的基线**不可用**时走能力降级（QUALITATIVE，定性诊断）而**不是** REFUSED ——
+#   这是与 A 的关键拓扑差异，也是它必须独立成机的理由。
+#
+# 检查器 regression-model.py 不手写守卫，只加载并执行本文件（守卫单一真源）。
+id: regression-controller
+version: 1
+max_rounds: 3
+round_cap: 5
+
+terminal: [CLOSED, LIMIT_REACHED, EXITED]
+base_states: [IDLE, INTAKE, BASELINE_READY, QUALITATIVE, COMPARED, DIAGNOSED, AWAITING_METRICS, CLOSED, LIMIT_REACHED, EXITED]
+
+parameterized:
+  prefix: REFUSED
+  field: origin
+  domain: [IDLE, INTAKE, BASELINE_READY, QUALITATIVE, DIAGNOSED, AWAITING_METRICS]
+
+events:
+  # ── 流程事件 ──
+  - SUBMIT
+  - BASELINE_OK
+  - BASELINE_MISSING
+  - BASELINE_MALFORMED
+  - COMPARE
+  - DIAGNOSE
+  - DISPATCH
+  - PASTE_METRICS
+  - RETRY
+  - EXIT
+  - MAX_ROUNDS
+  - STALL
+  # ── 错误事件（B 的错误事件闭集）──
+  # 全部 9 个 ErrCode 都在此声明：诊断入口是共用引擎，任何依赖源都可能在
+  # SUBMIT/COMPARE/DISPATCH 三条链路上抛出。其中 ERR_DIMENSIONS_NOT_LOADED /
+  # ERR_TEMPLATE_NOT_LOADED 只在"调用方额外给了 dimensions 并需要组装定向补采脚本"时可达，
+  # 由 DISPATCH 格的 registry_ok / template_ok 守卫建模（未给 dimensions 时视为空真）。
+  - ERR_MISSING_PARAM
+  - ERR_REPORT_CORRUPT
+  - ERR_DESENSITIZE_MISS
+  - ERR_DESENSITIZE_RULES_NOT_LOADED
+  - ERR_ROOTCAUSE_RULES_NOT_LOADED
+  - ERR_DIMENSIONS_NOT_LOADED
+  - ERR_TEMPLATE_NOT_LOADED
+  - ERR_BASELINE_MALFORMED
+  - ERR_INTERNAL
+
+# 配置空间：布尔量 + round；守卫只允许引用这些标识符与 derived
+bool_vars: [report_ok, desens_ok, corrupt, miss, baseline_present, baseline_ok, root_ok, registry_ok, template_ok, fix_available, changed, has_unconfirmed, has_partial]
+
+derived:
+  # 基线"提供了但非法" —— 这是 REFUSE（ERR_BASELINE_MALFORMED）而不是降级；
+  # 与"基线未提供"（→ QUALITATIVE 降级）是两条不同的边。
+  malformed: "baseline_present and not baseline_ok"
+  needs_metrics: "has_unconfirmed or has_partial"
+
+# 显式忽略语义（"显式忽略" ≠ "静默吸收"：必须状态不变、零副作用、且给出 hint）
+ignore:
+  action: IGNORE_HINT
+  writes_tracker: false
+  emits_events: []
+  emits_hint: true
+
+# 目标状态记号（与 A 机器同一套记号，共用引擎解析）：
+#   $self / $origin / $refused_of_self / REFUSED@<name>
+globals:
+  - states: non_terminal
+    event: EXIT
+    branches:
+      - guard: "true"
+        to: EXITED
+        action: "user exits"
+        writes_tracker: false
+  - states: non_terminal
+    event: ERR_MISSING_PARAM
+    branches:
+      - guard: "true"
+        to: $self
+        action: "return ERR_MISSING_PARAM (stay, ask for report/baselineType)"
+        writes_tracker: false
+  - states: non_terminal
+    event: ERR_INTERNAL
+    branches:
+      - guard: "true"
+        to: $refused_of_self
+        action: "return ERR_INTERNAL"
+        writes_tracker: false
+
+transitions:
+  - from: IDLE
+    event: SUBMIT
+    branches:
+      - { guard: "not report_ok", to: $self, action: "return ERR_MISSING_PARAM (report / baselineType)", writes_tracker: false }
+      - { guard: "report_ok and not desens_ok", to: "REFUSED@IDLE", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED (parse 二检不可跳过)", writes_tracker: false }
+      - { guard: "report_ok and desens_ok and corrupt", to: $self, action: "return ERR_REPORT_CORRUPT (reject whole report)", writes_tracker: false }
+      - { guard: "report_ok and desens_ok and not corrupt and miss", to: $self, action: "return ERR_DESENSITIZE_MISS (in-memory only)", writes_tracker: false }
+      - { guard: "report_ok and desens_ok and not corrupt and not miss", to: INTAKE, action: "report parsed -> decide baseline branch", writes_tracker: false }
+
+  - from: INTAKE
+    event: BASELINE_MISSING
+    branches:
+      - { guard: "not baseline_present", to: QUALITATIVE, action: "no baseline -> capability degradation (qualitative), NOT refuse", writes_tracker: false }
+      - { guard: "baseline_present", to: $self, action: "event contradicts state (baseline was supplied)", writes_tracker: false }
+
+  - from: INTAKE
+    event: BASELINE_OK
+    branches:
+      - { guard: "malformed", to: "REFUSED@INTAKE", action: "return ERR_BASELINE_MALFORMED", writes_tracker: false }
+      - { guard: "baseline_present and not malformed", to: BASELINE_READY, action: "baseline parsed (JSON/CSV) -> quantitative compare", writes_tracker: false }
+      - { guard: "not baseline_present", to: $self, action: "no baseline supplied: no quantitative edge", writes_tracker: false }
+
+  - from: INTAKE
+    event: BASELINE_MALFORMED
+    branches:
+      - { guard: "malformed", to: "REFUSED@INTAKE", action: "return ERR_BASELINE_MALFORMED (reject, do not silently degrade)", writes_tracker: false }
+      - { guard: "not malformed", to: $self, action: "event contradicts state", writes_tracker: false }
+
+  - from: BASELINE_READY
+    event: COMPARE
+    branches:
+      - { guard: "not root_ok", to: "REFUSED@BASELINE_READY", action: "return ERR_ROOTCAUSE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "root_ok", to: COMPARED, action: "metric-by-metric compare -> fired + within-threshold + unmeasured", writes_tracker: false }
+
+  - from: QUALITATIVE
+    event: COMPARE
+    branches:
+      - { guard: "not root_ok", to: "REFUSED@QUALITATIVE", action: "return ERR_ROOTCAUSE_RULES_NOT_LOADED (qualitative rule set)", writes_tracker: false }
+      - { guard: "root_ok", to: COMPARED, action: "qualitative (when-based) matching -> root causes", writes_tracker: false }
+
+  - from: COMPARED
+    event: DIAGNOSE
+    branches:
+      - { guard: "true", to: DIAGNOSED, action: "assemble rootCauses + fix tri-state + review", writes_tracker: false }
+
+  - from: DIAGNOSED
+    event: DISPATCH
+    branches:
+      - { guard: "needs_metrics and not registry_ok", to: "REFUSED@DIAGNOSED", action: "return ERR_DIMENSIONS_NOT_LOADED (targeted script path)", writes_tracker: false }
+      - { guard: "needs_metrics and registry_ok and not template_ok", to: "REFUSED@DIAGNOSED", action: "return ERR_TEMPLATE_NOT_LOADED (targeted script path)", writes_tracker: false }
+      - { guard: "needs_metrics and registry_ok and template_ok and not desens_ok", to: "REFUSED@DIAGNOSED", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED (script path is hard dep)", writes_tracker: false }
+      - { guard: "needs_metrics and registry_ok and template_ok and desens_ok", to: AWAITING_METRICS, action: "emit targeted re-collect script for the missing metrics", writes_tracker: false }
+      - { guard: "not needs_metrics and fix_available", to: CLOSED, action: "loop closed: quantitative/qualitative root cause with fix", writes_tracker: true }
+      - { guard: "not needs_metrics and not fix_available", to: "REFUSED@DIAGNOSED", action: "return ERR_INTERNAL (invariant I3 violated)", writes_tracker: false }
+
+  - from: AWAITING_METRICS
+    event: PASTE_METRICS
+    branches:
+      - { guard: "corrupt", to: $self, action: "return ERR_REPORT_CORRUPT", writes_tracker: false }
+      - { guard: "not corrupt and not desens_ok", to: "REFUSED@AWAITING_METRICS", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and miss", to: $self, action: "return ERR_DESENSITIZE_MISS", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and not miss and round + 1 > max_rounds", to: LIMIT_REACHED, action: "budget exhausted", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and not miss and round + 1 <= max_rounds", to: COMPARED, action: "round+=1; re-compare against the same baseline", writes_tracker: true, round_delta: 1 }
+
+  - from: AWAITING_METRICS
+    event: MAX_ROUNDS
+    branches:
+      - { guard: "round >= max_rounds", to: LIMIT_REACHED, action: "terminal: diagnostic cap reached", writes_tracker: false }
+      - { guard: "round < max_rounds", to: $self, action: "budget check passes -> stay", writes_tracker: false }
+
+  - from: AWAITING_METRICS
+    event: STALL
+    branches:
+      - { guard: "not changed", to: LIMIT_REACHED, action: "terminal: N rounds no metric change", writes_tracker: false }
+      - { guard: "changed", to: $self, action: "metrics changed -> continue", writes_tracker: false }
+
+  - from: "REFUSED@*"
+    event: RETRY
+    branches:
+      - { guard: "true", to: $origin, action: "user supplied a usable baseline / fixed dependency -> resume at origin", writes_tracker: false }
+
+# A3 独立性判据：守卫为常量 true（无数据依赖）且无副作用（不写 tracker / 不推进 round）
+independent_events: [EXIT, ERR_MISSING_PARAM, ERR_INTERNAL]
+
+# 有副作用、不构成独立事件（只能做终态一致性检查，不做全排列/不变量一致检查）
+side_effect_events: [SUBMIT, PASTE_METRICS, MAX_ROUNDS, STALL]
+
+# A3 有副作用配对检查用的两事件（B 的回填事件名与 A 的 PASTE_REPORT 不同）
+a3_pair: [PASTE_METRICS, EXIT]

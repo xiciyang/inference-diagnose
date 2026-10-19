@@ -1,0 +1,17 @@
+# Bundle patch for @xiciyang/inference-diagnose.
+#
+# 注册一个 host 组合条目：本插件向 tools 服务注册五个模型工具：
+#   generate_collect_script   采集脚本生成（内嵌脱敏）
+#   parse_collect_report      报告解析 + 二次脱敏校验
+#   diagnose_service          A 服务异常诊断（崩溃/启动失败/挂起/被外部杀/资源耗尽/输出异常）
+#   diagnose_regression       B 性能劣化诊断（客户提供基线；无基线时降级为定性诊断）
+#   diagnose_consistency      C 一致性诊断（能复现→检出非确定性；不能复现→查环境差异）
+#
+# `name` 必须是 npm 包名（经 profile 的 node_modules 解析），不能写相对路径：
+# bundle patch 的 loader baseUrl 是 PROFILE 目录，'./lib/index.js' 会解析成
+# <profile>/lib/index.js。
+- insert:
+    - id: inference-diagnose
+      name: '@xiciyang/inference-diagnose'
+      inject:
+        - tools

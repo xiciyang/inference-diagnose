@@ -1,0 +1,65 @@
+id: hardware-host-rules
+version: 1
+# 宿主（OS / 容器限额）根因规则簇 —— 2026-09-28 长任务 1 / A1 新增（纯数据，L1 热加载）。
+#
+# 为什么单独成文件而不是塞进各硬件维度：这四类成因**与加速卡品牌无关**
+# （NVIDIA 卡机、GB10 统一内存机、纯 CPU 机同样会发生），把同一机制复制三份会
+# 违反"同机制不留两条规则"。故被 gb10 / nvidia / cpu 三个 hardware 维度共同引用
+# （ruleFiles 是 Set，天然去重）。
+#
+# 与硬件簇的分工：本文件只主张**宿主资源**（内核 OOM killer / cgroup / 磁盘 / 进程与 fd 上限）
+# 造成的现象；"卡坏没坏"由 hardware-nvidia-rules.yaml 主张。两者可在同一次诊断里并存，
+# 因为一条是"谁杀的进程"、一条是"卡是否还在"。
+appliesTo:
+  hardware: [nvidia, gb10, cpu]
+rules:
+  - id: rc-host-001
+    when: 'Out of memory: Killed process|oom-kill:constraint'
+    signalExample: ['Out of memory: Killed process 4242 (python3) total-vm:48291632kB', 'oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/']
+    judgement: decisive
+    decisiveRationale: '命中的是内核 OOM killer 的两条固定记账行：`Out of memory: Killed process <pid>` 表示内核**已经**执行了击杀，`oom-kill:constraint=...` 同一事件的结构化伴随行（给出触发的是 cpuset / memory cgroup 还是全局约束）。这两条都只在击杀**发生之后**由内核打印，是既成事实而非诱因，故单行即足够；且探针与其它规则都不会产出这两个串。'
+    hypothesis: '推理进程被**宿主内核**的 OOM killer 杀死（不是推理引擎自己 abort）：表现为进程"凭空消失"、退出码 137，而应用日志里没有异常栈'
+    minEvidence: 1
+    strong: true
+    relevance: '这是"进程消失"类现象里最容易被误判的一条 —— 应用日志无异常、容器 ExitCode 137，若不做内核侧取证就会被当成引擎 bug'
+    fix:
+      code: '先按 evidence 区分约束来源：`oom-kill:constraint=CONSTRAINT_MEMCG` → 容器内存 limit 过小（调 docker --memory / cgroup memory.max，或减 --max-num-seqs、--max-model-len）；`CONSTRAINT_NONE` → 宿主整机内存不足（先查是否有其它进程抢内存，再给宿主加 swap 或降并发）。统一内存机型上还要额外注意宿主可用内存本身就被模型权重吃掉'
+      verification: '复跑同一负载 30 分钟：dmesg 不再出现 Out of memory: Killed process；容器 RSS 峰值稳定低于 limit 的 85%'
+      rollback: '恢复原内存 limit 与并发参数（报告已留存原 cmdline 与 cgroup 限额）'
+      riskLevel: high
+  - id: rc-host-002
+    when: 'page allocation failure|Memory cgroup out of memory'
+    signalExample: ['page allocation failure: order:4, mode:0x40cc0(GFP_KERNEL)', 'Memory cgroup out of memory: Killed process 4242 (python3)']
+    judgement: contextual
+    hypothesis: '内存压力已在**内核分配层**显现（高阶页分配失败或 cgroup 内存超限）：即使进程还没被杀，内核回收已开始拖慢推理，表现为延迟抖动而非崩溃'
+    minEvidence: 1
+    relevance: 'page allocation failure 与 cgroup 超限是两种不同的压力来源（碎片化 vs 限额），需结合 host-mem 的 MemAvailable 与 cgroup.memory.max/current 交叉判断'
+    fix:
+      code: '先读证判断来源：host-mem 的 mem.available_kb 与 host-limits 的 cgroup.memory.max/current 对比 —— current 贴近 max 即限额问题（调 limit 或降并发）；available 长期偏低而 max 宽松则是宿主整体压力（找出真正吃内存的进程，不要盲目调大本服务）'
+      verification: '调整后压测 30 分钟：dmesg 不再出现新的 page allocation failure / cgroup OOM 行；延迟 p99 回落'
+      rollback: '恢复原 cgroup limit 与并发配置'
+      riskLevel: medium
+  - id: rc-host-003
+    when: 'No space left on device|Disk quota exceeded'
+    signalExample: ['OSError: [Errno 28] No space left on device', 'Disk quota exceeded while writing /root/.cache/vllm']
+    judgement: contextual
+    hypothesis: '磁盘写满（含配额超限）：模型权重/编译缓存/日志/审计写入失败，引擎可能在加载或落盘阶段中断；若写的是审计或状态文件，还会让"证据链"不完整'
+    minEvidence: 1
+    relevance: '需与 host-limits 的 df 输出交叉核对是哪个挂载点满（/ 与 /data 常不同）；写满 `~/.cache`（torch.compile / vLLM 编译缓存）最常见'
+    fix:
+      code: '先按 df 定位挂载点，再清理可重建的缓存（vLLM torch_compile_cache、pip 缓存、旧镜像），不要删模型权重与既有产出目录；若是配额问题则申请扩容'
+      verification: '清理后 df 对应挂载点可用空间 > 10%；重跑同一负载能完整落盘且不再报 Errno 28'
+      rollback: '被清理的都是可重建缓存；若误删，按原路径重新生成即可'
+      riskLevel: low
+  - id: rc-host-004
+    when: 'Resource temporarily unavailable|fork: Cannot allocate memory'
+    signalExample: ['EAGAIN: Resource temporarily unavailable while accepting connection', 'bash: fork: Cannot allocate memory']
+    judgement: contextual
+    hypothesis: '进程/线程数或文件描述符达到上限（ulimit -u / -n、cgroup pids.max）：新连接与 worker 线程创建失败，表现为"服务还在但拒绝服务"'
+    minEvidence: 1
+    relevance: '两条措辞指向同一族限额但形态不同：`Resource temporarily unavailable` 多为 fd/线程创建失败的 EAGAIN，`fork: Cannot allocate memory` 是进程数（或内存）耗尽；报告里的 ulimit.nofile / ulimit.nproc 正是判据'
+    fix:
+      code: '按 host-limits 的实测值抬高限额：容器内调 --ulimit nofile=65536:65536 --ulimit nproc=...，或调 cgroup pids.max；同时排查是否有 fd/线程泄漏（lsof -p 计数随时间增长）'
+      verification: '抬高后复现同一并发压力：不再出现 EAGAIN / fork 失败，且 lsof 计数在稳态不持续增长'
+      rollback: '恢复原 ulimit 与 cgroup 配置'
+      riskLevel: medium

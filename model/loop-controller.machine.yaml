@@ -1,0 +1,154 @@
+# loop-controller 状态机 —— 单一真源（single source of truth）
+# 设计文档 §3.2 的转移表、§3.2 的模型检查、§4/§5 的验证管道，均以本文件为准。
+# 检查器 loop-controller-model.py 不再手写守卫，只加载并执行本文件。
+id: loop-controller
+version: 1
+max_rounds: 3
+round_cap: 5
+
+terminal: [CLOSED, LIMIT_REACHED, EXITED]
+base_states: [IDLE, SCRIPT_READY, REPORT_PARSED, DIAGNOSED, FIX_APPLIED, AWAITING_COLLECTION, CLOSED, LIMIT_REACHED, EXITED]
+
+parameterized:
+  prefix: REFUSED
+  field: origin
+  domain: [IDLE, SCRIPT_READY, REPORT_PARSED, DIAGNOSED, FIX_APPLIED, AWAITING_COLLECTION]
+
+residence: [AWAITING_COLLECTION, "REFUSED@*"]
+
+events:
+  - DESCRIBE
+  - PASTE_REPORT
+  - DIAGNOSE
+  - DISPATCH
+  - FIX_OK
+  - FIX_FAIL
+  - RETRY
+  - EXIT
+  - ERR_MISSING_PARAM
+  - ERR_REPORT_CORRUPT
+  - ERR_DESENSITIZE_MISS
+  - ERR_DESENSITIZE_RULES_NOT_LOADED
+  - ERR_ROOTCAUSE_RULES_NOT_LOADED
+  - ERR_DIMENSIONS_NOT_LOADED
+  - ERR_TEMPLATE_NOT_LOADED
+  - ERR_INTERNAL
+  - MAX_ROUNDS
+  - STALL
+
+# 配置空间：布尔量 + round；守卫只允许引用这些标识符与 derived
+bool_vars: [dims_ok, registry_ok, desens_ok, template_ok, root_ok, corrupt, miss, changed, has_unconfirmed, has_partial, fix_available]
+
+derived:
+  needs_additional: "has_unconfirmed or has_partial"
+
+# 显式忽略语义（"显式忽略" ≠ "静默吸收"：必须状态不变、零副作用、且给出 hint）
+ignore:
+  action: IGNORE_HINT
+  writes_tracker: false
+  emits_events: []
+  emits_hint: true
+
+# 目标状态记号：
+#   $self            当前状态
+#   $origin          参数化状态的 origin 字段（REFUSED@o 的 o）
+#   $refused_of_self s 为 REFUSED@* → s；否则 REFUSED@s（s 非法 origin 时 REFUSED@IDLE）
+#   REFUSED@<name>   显式参数化状态
+globals:
+  - states: non_terminal
+    event: EXIT
+    branches:
+      - guard: "true"
+        to: EXITED
+        action: "user exits"
+        writes_tracker: false
+  - states: non_terminal
+    event: ERR_MISSING_PARAM
+    branches:
+      - guard: "true"
+        to: $self
+        action: "return ERR_MISSING_PARAM (stay, ask for param)"
+        writes_tracker: false
+  - states: non_terminal
+    event: ERR_INTERNAL
+    branches:
+      - guard: "true"
+        to: $refused_of_self
+        action: "return ERR_INTERNAL"
+        writes_tracker: false
+
+transitions:
+  - from: IDLE
+    event: DESCRIBE
+    branches:
+      - { guard: "not dims_ok", to: $self, action: "return ERR_MISSING_PARAM (hint lists dim values)", writes_tracker: false }
+      - { guard: "dims_ok and not registry_ok", to: "REFUSED@IDLE", action: "return ERR_DIMENSIONS_NOT_LOADED", writes_tracker: false }
+      - { guard: "dims_ok and registry_ok and not desens_ok", to: "REFUSED@IDLE", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "dims_ok and registry_ok and desens_ok and not template_ok", to: "REFUSED@IDLE", action: "return ERR_TEMPLATE_NOT_LOADED", writes_tracker: false }
+      - { guard: "dims_ok and registry_ok and desens_ok and template_ok", to: SCRIPT_READY, action: "generate_collect_script ok", writes_tracker: false }
+
+  - from: SCRIPT_READY
+    event: PASTE_REPORT
+    branches:
+      - { guard: "corrupt", to: $self, action: "return ERR_REPORT_CORRUPT (reject whole report)", writes_tracker: false }
+      - { guard: "not corrupt and not desens_ok", to: "REFUSED@SCRIPT_READY", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and miss", to: $self, action: "return ERR_DESENSITIZE_MISS (in-memory only)", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and not miss", to: REPORT_PARSED, action: "parse ok (may carry missingSections)", writes_tracker: false }
+
+  - from: REPORT_PARSED
+    event: DIAGNOSE
+    branches:
+      - { guard: "not root_ok", to: "REFUSED@REPORT_PARSED", action: "return ERR_ROOTCAUSE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "root_ok", to: DIAGNOSED, action: "diagnose_crash ok -> rootCauses[]", writes_tracker: false }
+
+  - from: DIAGNOSED
+    event: DISPATCH
+    branches:
+      - { guard: "needs_additional and not desens_ok", to: "REFUSED@DIAGNOSED", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED (script path is hard dep)", writes_tracker: false }
+      - { guard: "needs_additional and desens_ok", to: AWAITING_COLLECTION, action: "emit targeted re-collect script (desensitize embedded)", writes_tracker: false }
+      - { guard: "not needs_additional and fix_available", to: FIX_APPLIED, action: "hand off fix plan", writes_tracker: false }
+      - { guard: "not needs_additional and not fix_available", to: "REFUSED@DIAGNOSED", action: "return ERR_INTERNAL (invariant I3 violated)", writes_tracker: false }
+
+  - from: FIX_APPLIED
+    event: FIX_OK
+    branches:
+      - { guard: "true", to: CLOSED, action: "loop closed", writes_tracker: true }
+
+  - from: FIX_APPLIED
+    event: FIX_FAIL
+    branches:
+      - { guard: "round + 1 > max_rounds", to: LIMIT_REACHED, action: "budget exhausted", writes_tracker: false }
+      - { guard: "round + 1 <= max_rounds and not desens_ok", to: "REFUSED@FIX_APPLIED", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "round + 1 <= max_rounds and desens_ok", to: AWAITING_COLLECTION, action: "emit targeted re-collect script", writes_tracker: false }
+
+  - from: AWAITING_COLLECTION
+    event: PASTE_REPORT
+    branches:
+      - { guard: "corrupt", to: $self, action: "return ERR_REPORT_CORRUPT", writes_tracker: false }
+      - { guard: "not corrupt and not desens_ok", to: "REFUSED@AWAITING_COLLECTION", action: "return ERR_DESENSITIZE_RULES_NOT_LOADED", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and miss", to: $self, action: "return ERR_DESENSITIZE_MISS", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and not miss and round + 1 > max_rounds", to: LIMIT_REACHED, action: "budget exhausted", writes_tracker: false }
+      - { guard: "not corrupt and desens_ok and not miss and round + 1 <= max_rounds", to: REPORT_PARSED, action: "round+=1; closure-tracker commit; parse", writes_tracker: true, round_delta: 1 }
+
+  - from: AWAITING_COLLECTION
+    event: MAX_ROUNDS
+    branches:
+      - { guard: "round >= max_rounds", to: LIMIT_REACHED, action: "terminal: diagnostic cap reached", writes_tracker: false }
+      - { guard: "round < max_rounds", to: $self, action: "budget check passes -> stay", writes_tracker: false }
+
+  - from: AWAITING_COLLECTION
+    event: STALL
+    branches:
+      - { guard: "not changed", to: LIMIT_REACHED, action: "terminal: N rounds no evidence change", writes_tracker: false }
+      - { guard: "changed", to: $self, action: "evidence changed -> continue", writes_tracker: false }
+
+  - from: "REFUSED@*"
+    event: RETRY
+    branches:
+      - { guard: "true", to: $origin, action: "user fixed dependency -> resume at origin", writes_tracker: false }
+
+# A3 独立性判据：守卫为常量 true（无数据依赖）且无副作用（不写 tracker / 不推进 round）
+independent_events: [EXIT, ERR_MISSING_PARAM, ERR_INTERNAL]
+
+# 有副作用、不构成独立事件（只能做终态一致性检查，不做全排列/不变量一致检查）
+side_effect_events: [PASTE_REPORT, FIX_OK, FIX_FAIL, MAX_ROUNDS, STALL]

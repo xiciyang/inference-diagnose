@@ -1,0 +1,15 @@
+=== metrics-full ===
+--- cmd: probe-metrics-full
+--- 抢占/KV/队列/调度（H-C 直接证据链）:
+--- 推测解码（H-B 直接证据链：接受率/草稿量）:
+=== end:metrics-full ===
+=== quality-sweep ===
+--- cmd: probe-quality-sweep
+DSH-SIGNAL quality.sweep.done=true（core_hash 仅覆盖 content/reasoning/finish；snapshot 用于把异常样本与 spec_decode/抢占/缓存计数关联）
+DSH-SIGNAL quality.sweep.valid=0/8 (有效样本数：n/a 的不是样本，不能计入一致性判定)
+=== end:quality-sweep ===
+=== engine-log ===
+--- cmd: probe-engine-log
+--- [启动期] 生效配置字段:
+--- [尾部 3000 行] 请求级参数/调度统计/告警:
+=== end:engine-log ===

@@ -1,0 +1,125 @@
+id: output-anomaly-rules
+version: 1
+# ── A 范式（服务异常诊断）· 输出异常规则簇 —— 2026-09-28 新增（纯数据，L1 热加载）──
+#
+# A 的扩面（用户 2026-09-28 裁决）：在原覆盖（崩溃 / 启动失败 / 挂起 / 被外部杀 / 资源耗尽）
+# 之外新增「输出异常」——乱码、截断、重复、语义错误。
+#
+# 定位说明（关键）：乱码/截断/重复/语义错误都是**当前状态异常**，与崩溃同构——
+#   采集当前配置 + 日志 + 输出样本 → 规则匹配 → 根因。**不需要基线**，
+#   不是"精度退化"（那属 B 范式，需要客户基线），因此归 A 而不归 B。
+#
+# 正则纪律（2026-09-28 真实端点实测缺陷）：`when` 必须匹配**承载判据的那一行**，
+# 不得匹配"提到该词的任何一行"——裸 `repeat` / `loop` / `temp` / `chat_template` 会命中
+# `prefill_repeat_consistent` / `uvloop` / `template` / 探针自身标签文本，产生假阳性。
+#
+# 与 quality-gibberish-rules.yaml 的分工：那份覆盖"输出**内容**乱"（量化/rope/tokenizer/并行…）；
+# 本份覆盖"输出**形态**异常"（长度截断、复读、编码损坏、渲染错位、语义错位）。
+rules:
+  - id: rc-out-001
+    when: '"finish":"?length"?|finish_reason="?length|finish=length|被长度截断|generation.*truncat'
+    signalExample: ['"finish":"length"', 'finish_reason="length"', 'finish=length', '输出被长度截断', 'generation truncated at 512 tokens']
+    judgement: decisive
+    decisiveRationale: '命中的是响应体/指标的 `finish_reason=length`（或 `"finish":"length"`）：这是解码器**自己上报的截断原因**，不是推测；模型正常收尾时该字段为 `stop`，故 length 出现即"输出被 max_tokens 截断"这一事实本身。'
+    hypothesis: '输出被 max_tokens 截断（finish_reason=length）：用户看到的是"半句话"，容易被误判为模型乱码或语义错误——这是**输出异常里最常见、也最便宜可排除的一整类**'
+    minEvidence: 1
+    strong: true
+    relevance: '判据来自响应体的 finish_reason 字段或 /metrics 的 request_success_total{finished_reason="length"}；命中即先按截断处理，不要先怀疑模型'
+    fix:
+      code: '把客户端 max_tokens 提高（或按业务改为"以 stop 结束"）；若为思考型模型（响应含 reasoning 字段），需分别为 reasoning 与 content 预留预算，避免 reasoning 吃光预算导致 content 为空'
+      verification: '同 prompt 复测：finish_reason=stop，且 content 非空、句意完整；再跑一次长输出场景确认不再截断'
+      rollback: '恢复原 max_tokens / 采样参数（本项只改请求参数，无需重启服务）'
+      riskLevel: low
+  - id: rc-out-002
+    when: 'quality\.content_empty=true|"content":""|content 为空|reasoning.*非空.*content.*空'
+    signalExample: ['DSH-SIGNAL quality.content_empty=true', '{"choices":[{"message":{"content":""}}]}', 'content 为空而 reasoning 有内容', 'reasoning 非空但 content 空']
+    judgement: decisive
+    decisiveRationale: '命中的是响应体字段 `content` 为空（`"content":""`）或探针给出的 `quality.content_empty=true`：前者是响应结构里的**实际取值**，后者由探针直接解析响应体得出。content 非空时该机制不可能成立，故单行即足够。'
+    hypothesis: '响应 content 为空而 reasoning 非空（或两者错位）：思考型模型的思考段吃光了 token 预算，或前端把 reasoning 与 content 拼接/渲染错位——用户看到的是"半句接半句 + 混杂"'
+    minEvidence: 1
+    strong: true
+    relevance: '直接取自响应体的字段（content 为空、reasoning 有内容）；这是"前端渲染错位"与"模型输出异常"的分水岭'
+    fix:
+      code: '确认客户端渲染的是 content 而非 reasoning（或按产品设计显式分区展示）；给 reasoning 与 content 分别设定预算；不要把 reasoning 拼进对话正文'
+      verification: '同请求复测：content 非空且语义完整；前端展示区与 API 原始字段一一对应（F12 → Network → Response 核对）'
+      rollback: '恢复客户端渲染逻辑与请求参数'
+      riskLevel: low
+  - id: rc-out-003
+    when: 'repetition[ _-]?penalty|repetition[ _-]?(rate|count|detected)|repeat_penalty|复读|重复率|n-gram|n_gram'
+    signalExample: ['repetition_penalty=1.05', 'repetition_rate=0.62', 'repeat_penalty=1.1', '疑似复读', '重复率 62%', 'n-gram overlap detected', 'n_gram repeat count=8']
+    judgement: contextual
+    hypothesis: '输出重复（复读同一段/同一 token 序列）：采样参数（repetition/presence/frequency penalty 过大或过小）与 KV/前缀缓存复用共同作用，也可能由算子错误导致同一 token 反复被选中'
+    minEvidence: 1
+    relevance: '需与 temp=0 复现对照联判：若 temp=0 下仍复读，则排除采样随机性，指向非确定性计算或缓存复用'
+    fix:
+      code: '先用 temperature=0、关闭惩罚项复测确认模型本身是否正常；生产参数建议 temperature<=0.7、top_p<=0.9，惩罚项按模型训练口径设置；若仍复读 → 关闭 prefix caching 与动态 batching 复测'
+      verification: '同 prompt temp=0 连跑 5 次：输出一致且无复读；再按生产参数跑 5 次无复读'
+      rollback: '恢复原采样与服务参数（报告已留存 cmdline）'
+      riskLevel: low
+  - id: rc-out-004
+    when: '\\ufffd|�|U\+FFFD|replacement character|mojibake|控制字符|乱码字节'
+    signalExample: ['"content":"\ufffd"', 'content contains �', 'U+FFFD found in response', 'replacement character in output', 'mojibake detected', '控制字符 0x01 出现在响应', '乱码字节序列']
+    # 显式豁免（门禁 G6）：本规则的 `\\ufffd` 分支是**故意**匹配"JSON 转义后的字面文本 \ufffd"
+    # （报告里可能留下 6 个字符的转义串，而不是真正的 U+FFFD 字符）。其余规则若出现双反斜杠
+    # 一律判为死分支（在该 YAML 引号约定下等价于"匹配一个反斜杠"，永远命中不了）→ 门禁 FAIL。
+    literalBackslash: true
+    judgement: decisive
+    decisiveRationale: '命中的是响应原文里的替换字符 `U+FFFD`（`�`）：U+FFFD 是解码器在**遇到无法映射的字节序列时才会写入**的替换字符，正常 UTF-8 往返不会产生它，故它的出现直接证明"字节/编码/流解析层发生了损坏"，无需模型侧证据。已收窄正则去掉裸 `surrogate`（会命中 `surrogate=` 这类配置项）。'
+    hypothesis: '输出含替换字符（U+FFFD）或控制字符：这是**字节/编码/流解析层**的损坏（网关截断 UTF-8 序列、SSE 分块边界切在多字节字符中间、客户端按错误编码解码），**不是模型**——必须先分流掉，否则后面所有模型侧排查都是浪费'
+    minEvidence: 1
+    strong: true
+    relevance: '判据是"响应原文里出现 U+FFFD 或控制字符"；出现即定位到传输/渲染层。若原文语义就乱而无替换字符，才轮到模型侧（见 quality-gibberish-rules）'
+    fix:
+      code: '取**原始响应字节**（不要看渲染后的文本）逐段校验 UTF-8 边界；检查网关/代理是否按行切分 SSE 或做了二次编码；客户端统一按 UTF-8 解码。服务端不建议动'
+      verification: '同一请求改走直连（绕过网关）复测：替换字符消失即可定位到网关/客户端；若直连仍出现，再查服务端输出编码'
+      rollback: '恢复网关分块/编码配置'
+      riskLevel: medium
+  - id: rc-out-005
+    when: 'chat_template\.file=|chat_template=|chat template|模板.{0,24}(不匹配|错位)|工具调用.{0,24}(异常|不匹配|错位|格式)|tool_call.{0,24}malformed'
+    signalExample: ['DSH-SIGNAL chat_template.file=/app/t.jinja', 'chat_template=/app/t.jinja', 'chat template not applied', '模板渲染错位', '工具调用格式不匹配', 'tool_call payload malformed']
+    judgement: contextual
+    hypothesis: '输出语义错位（答非所问、混入伪代码/工具片段）：chat template 与模型训练口径不匹配，或用未经训练的模板拼接工具调用轨迹，导致模型在分布外续写'
+    minEvidence: 1
+    relevance: '判据是"纯文本单轮正常、带工具轨迹/特定角色就崩"的对照；报告里 chat-template 段已采集生效模板与工具调用风格请求的返回'
+    # 本条是**关键词类规则**（非决定性数值信号）：把「值得先看模板」的上下文挑出来。
+    # 因此加因果门槛——没有 A/B 开闭或回切复现时不得称「已证明」。
+    causal:
+      closurePattern: 'DSH-SIGNAL causal\.(ab_toggle|revert_repro|binary_sha_match)=true'
+      requireForProven: true
+    fix:
+      code: '使用模型发布包自带的 chat template（不要把 tokenizer_config.chat_template 与 --chat-template 文件混用）；工具调用须用模型训练的格式（tool-call-parser / reasoning-parser 与模型配套）'
+      verification: '同 prompt 三组对照：纯文本单轮 / 带系统提示 / 带工具轨迹——修复后三组均语义正确'
+      rollback: '恢复原模板文件（报告已留存模板内容与路径）'
+      riskLevel: medium
+  - id: rc-out-006
+    # 缺陷 #55（2026-09-28 真机报告实测）：裸 `broken pipe` 命中了**采集脚本自身的 shell 报错**
+    # ——报告第 237 行被 `grep: write error: Broken pipe` 截断并混入（这是采集侧 EPIPE，不是服务行为）。
+    # 负向后顾排除该形态；服务侧的 `upstream ... broken pipe` 仍照常命中。
+    when: 'truncat|截断|incomplete|partial response|stream.*abort|连接被重置|(?<!write error: )broken pipe'
+    signalExample: ['response truncated', '输出被截断', 'incomplete response body', 'received partial response', 'stream aborted by peer', '连接被重置', 'upstream connect error: Broken pipe']
+    judgement: contextual
+    hypothesis: '输出被**传输层**截断（流式连接中断、网关超时、代理缓冲上限）：与 max_tokens 截断不同，这类截断没有 finish_reason=length，而是连接层面提前结束'
+    minEvidence: 1
+    relevance: '判据是"响应不完整但 finish_reason 不为 length"（或缺 finish_reason）；需与网关超时/缓冲配置交叉'
+    fix:
+      code: '检查网关的 read/idle timeout 与响应缓冲上限；关闭对大响应的缓冲（proxy_buffering off）；核对客户端读超时；长输出场景建议走流式并设置心跳'
+      verification: '长输出（>4k tokens）复测 5 次：均正常收尾且 finish_reason 存在'
+      rollback: '恢复网关超时与缓冲配置'
+      riskLevel: medium
+  - id: rc-out-007
+    when: 'DSH-SIGNAL\s+evidence\.missing\.3=response_body|response_body（|未落响应正文'
+    signalExampleExempt: 'when 匹配 evidence.missing.3=response_body，声明"响应正文未落盘 ⇒ 输出内容无法从服务端判定"'
+    judgement: contextual
+    hypothesis: '证据缺口声明：本报告没有响应正文，因此"输出内容是否正确/是否乱码"这一整类问题**在原理上不可判定**——必须显式声明，不能靠推理补全'
+    minEvidence: 1
+    strong: true
+    relevance: 'vLLM 默认不落响应正文；需从客户端留痕、网关日志或平台记录取得原件。缺证据 ≠ 未发现反例'
+    fix: null
+  - id: rc-out-008
+    when: 'DSH-SIGNAL\s+evidence\.missing\.1=client_request_params|未开 --enable-log-requests'
+    signalExampleExempt: 'when 匹配 evidence.missing.1=client_request_params，声明"未开请求级日志 ⇒ 客户端采样参数不可见"'
+    judgement: contextual
+    hypothesis: '证据缺口声明：本报告没有客户端请求参数（temperature/惩罚/max_tokens），因此"采样类"与"截断类"假设不可判定'
+    minEvidence: 1
+    relevance: '恢复方式：服务端开 --enable-log-requests（一次重启，只增日志详细度），或由客户端把请求参数随响应一起留痕'
+    fix: null

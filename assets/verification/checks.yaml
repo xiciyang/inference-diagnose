@@ -1,0 +1,49 @@
+id: checks
+version: 1
+# §4.5 检查项清单（机器可读真源；docs/superpowers/specs/S-A-list.md 为人读投影）。
+# 输入契约（未决 #2 已裁决）：每项含 id + 断言文本；配置另传。
+checks:
+  - id: S1
+    assert: "可达性：BFS 从 init，所有状态可达"
+  - id: S2
+    assert: "死锁：非终态无出边"
+  - id: S3
+    assert: "活性：无出口吸收环"
+  - id: S4
+    assert: "确定性：同状态 + 同事件 → 唯一目标"
+  - id: S5
+    assert: "事件完备：每状态对每事件有定义（或显式忽略）"
+  - id: S6
+    assert: "守卫完备：转移守卫每分支有路径"
+  - id: S7
+    assert: "不变量有效"
+  - id: S8
+    assert: "单调变量不倒退"
+  - id: A1
+    assert: "意外事件：注入未定义事件 → 状态不变 + 零副作用 + 不写 tracker + 给出 hint"
+  - id: A2
+    assert: "竞态交错：E1/E2 两顺序终态一致"
+  - id: A3
+    assert: "顺序置换：N 独立事件全排列终态一致"
+  - id: A4
+    assert: "配对对称"
+  - id: A5
+    assert: "边界爆破：round / maxRounds / stall / maxReportKB 边界值"
+  - id: A6
+    assert: "资源注入：资产解析失败、规则库加载失败/超时的恢复路径"
+  - id: A7
+    assert: "最小反例：S7 不变量违例时的 BFS 最短序列"
+  - id: A8
+    assert: "幂等重放：同一报告重复粘贴、同轮转移重复触发"
+  - id: A9
+    assert: "导向：每路径达终态（闭环 / 用户退出 / 诊断上限）"
+  - id: A10
+    assert: "序列顺序：collect → parse → diagnose → 重采集 不倒序"
+  - id: A11
+    assert: "原子性：轮次状态提交（closure-tracker 写入）提交或回滚"
+  - id: A12
+    assert: "预算：maxRounds + stall 双闸门，每可达路径 ≤ 预算"
+  - id: A13
+    assert: "概率可达（DTMC）：诊断中规则热更新赋权后 P(正常完成) ≥ 阈值"
+  - id: A14
+    assert: "截止（离散时钟）：驻留态限时提醒而非静默"

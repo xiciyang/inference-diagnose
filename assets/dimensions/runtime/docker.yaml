@@ -1,0 +1,16 @@
+id: docker
+kind: runtime
+displayName: Docker 容器运行时
+version: 2
+probes:
+  - id: container-state
+    section: container-state
+    command: "if command -v docker >/dev/null 2>&1; then docker ps -a --format '{{.Names}} {{.Status}} {{.Image}}'; else echo \"DSH-SIGNAL docker.cli=unavailable (在容器内执行：宿主机上跑本脚本才能采到容器证据)\"; fi"
+  - id: container-log
+    section: container-log
+    command: "if command -v docker >/dev/null 2>&1; then docker logs --tail 300 $(docker ps -lq); else echo \"DSH-SIGNAL docker.cli=unavailable (在容器内执行：宿主机上跑本脚本才能采到容器证据)\"; fi"
+  - id: container-limits
+    section: container-state
+    command: "if command -v docker >/dev/null 2>&1; then docker inspect $(docker ps -lq) --format '{{.HostConfig.Memory}} {{.HostConfig.ShmSize}}'; else echo \"DSH-SIGNAL docker.cli=unavailable (在容器内执行：宿主机上跑本脚本才能采到容器证据)\"; fi"
+ruleRefs:
+  - root-causes/runtime-docker-rules.yaml

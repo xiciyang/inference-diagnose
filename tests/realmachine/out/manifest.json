@@ -1,0 +1,169 @@
+{
+  "templateId": "collect-script",
+  "templateFile": "collect-mindie.yaml",
+  "dims": {
+    "framework": "vllm",
+    "runtime": "docker",
+    "hardware": "gb10"
+  },
+  "sections": [
+    "vllm-version",
+    "vllm-serving-args",
+    "vllm-endpoint",
+    "vllm-log",
+    "chat-template",
+    "model-config",
+    "model-weights",
+    "tokenizer-fingerprint",
+    "tokenizer-roundtrip",
+    "quality-probe",
+    "precision-log",
+    "quality-sweep",
+    "effective-config",
+    "metrics-full",
+    "evidence-gaps",
+    "engine-log",
+    "logits-probe",
+    "index-address-probe",
+    "perf-snapshot",
+    "container-state",
+    "container-log",
+    "nv-device",
+    "nv-driver-matrix",
+    "nv-ecc",
+    "nv-thermal",
+    "kernel-log",
+    "nv-topology",
+    "host-mem",
+    "host-limits"
+  ],
+  "probes": [
+    {
+      "probe": "vllm-version",
+      "section": "vllm-version"
+    },
+    {
+      "probe": "serving-args",
+      "section": "vllm-serving-args"
+    },
+    {
+      "probe": "vllm-endpoint",
+      "section": "vllm-endpoint"
+    },
+    {
+      "probe": "vllm-log",
+      "section": "vllm-log"
+    },
+    {
+      "probe": "chat-template",
+      "section": "chat-template"
+    },
+    {
+      "probe": "model-config",
+      "section": "model-config"
+    },
+    {
+      "probe": "model-weights",
+      "section": "model-weights"
+    },
+    {
+      "probe": "tokenizer-fingerprint",
+      "section": "tokenizer-fingerprint"
+    },
+    {
+      "probe": "tokenizer-roundtrip",
+      "section": "tokenizer-roundtrip"
+    },
+    {
+      "probe": "quality-probe",
+      "section": "quality-probe"
+    },
+    {
+      "probe": "precision-log",
+      "section": "precision-log"
+    },
+    {
+      "probe": "quality-sweep",
+      "section": "quality-sweep"
+    },
+    {
+      "probe": "effective-config",
+      "section": "effective-config"
+    },
+    {
+      "probe": "metrics-full",
+      "section": "metrics-full"
+    },
+    {
+      "probe": "evidence-gaps",
+      "section": "evidence-gaps"
+    },
+    {
+      "probe": "engine-log",
+      "section": "engine-log"
+    },
+    {
+      "probe": "logits-probe",
+      "section": "logits-probe"
+    },
+    {
+      "probe": "index-address-probe",
+      "section": "index-address-probe"
+    },
+    {
+      "probe": "perf-snapshot",
+      "section": "perf-snapshot"
+    },
+    {
+      "probe": "container-state",
+      "section": "container-state"
+    },
+    {
+      "probe": "container-log",
+      "section": "container-log"
+    },
+    {
+      "probe": "container-limits",
+      "section": "container-state"
+    },
+    {
+      "probe": "nv-device",
+      "section": "nv-device"
+    },
+    {
+      "probe": "nv-driver-matrix",
+      "section": "nv-driver-matrix"
+    },
+    {
+      "probe": "nv-ecc",
+      "section": "nv-ecc"
+    },
+    {
+      "probe": "nv-thermal",
+      "section": "nv-thermal"
+    },
+    {
+      "probe": "nv-xid",
+      "section": "kernel-log"
+    },
+    {
+      "probe": "nv-topology",
+      "section": "nv-topology"
+    },
+    {
+      "probe": "kernel-log",
+      "section": "kernel-log"
+    },
+    {
+      "probe": "host-mem",
+      "section": "host-mem"
+    },
+    {
+      "probe": "host-limits",
+      "section": "host-limits"
+    }
+  ],
+  "rules": "desensitize-v1",
+  "assets": "sha256:74d3544bc9918c150a615b5a09b82fa0",
+  "generatedAt": "2026-09-29T04:29:40.300Z"
+}

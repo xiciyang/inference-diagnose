@@ -1,0 +1,134 @@
+id: quality-gibberish-rules
+version: 1
+# 输出质量退化（"推理乱码"）根因规则簇 —— 2026-09-23 新增（纯数据，L1 热加载）。
+# 约束：规则 when 是对**单条 evidence 片段**做正则匹配（root-cause-rules.match），
+#       因此差分逻辑不写在条件里，而由探针输出**单行信号**（DSH-SIGNAL ...）+ relevance 承载。
+appliesTo:
+  framework: [mindie, vllm]
+rules:
+  - id: rc-qg-001
+    when: 'quant_method|quantization_config|load_in_8bit|load_in_4bit|w8a8|w4a16|kv_scale|amax|--quantization|kv-cache-dtype'
+    signalExample: ['"quant_method": "ascend"', '"quantization_config": {...}', 'load_in_8bit=True', 'load_in_4bit=True', 'quantization=w8a8', 'quantization=w4a16', 'kv_scale shape=[1, 128]', 'activation amax tensor computed', '--quantization compressed-tensors', '--kv-cache-dtype auto']
+    judgement: contextual
+    hypothesis: '权重/量化配置与 checkpoint 不匹配（量化 scale 缺失或 dtype 误配）：反量化误差会让 logits 整体漂移，表现为"通顺但语义错"的乱码'
+    minEvidence: 1
+    strong: true
+    relevance: '模型 config 的量化字段或 scale 文件清单命中；需与模型发布包的量化声明逐项对照'
+    fix:
+      code: '按模型发布包声明的量化格式重载：核对 quantization_config.quant_method 与 scale/amax 文件是否齐全；缺失即补齐，无法补齐则加载未量化 checkpoint（bf16/fp16）对照'
+      verification: '同 temp=0 固定 prompt 跑 3 次：输出逐字一致且语义正确；再跑 8k 长上下文同样的固定 prompt'
+      rollback: '保留原量化配置与 scale 文件备份（tar 包 + sha256），失败按备份回滚'
+      riskLevel: high
+  - id: rc-qg-002
+    when: 'rope_scaling|rope_theta|max_position_embeddings'
+    signalExample: ['"rope_scaling": {"type": "linear"}', '"rope_theta": 500000.0', '"max_position_embeddings": 8192']
+    judgement: contextual
+    hypothesis: '位置编码/长上下文外推配置与训练时不一致（rope_scaling 类型或 base 频率被改过）：短 prompt 尚可、长 prompt 先崩坏'
+    minEvidence: 1
+    relevance: 'config 的 rope 相关字段命中；判据是"短 prompt 正常 + 长 prompt 乱"的对照，而非单看字段存在'
+    fix:
+      code: '以模型原始 config.json 为准恢复 rope_scaling/rope_theta/max_position_embeddings 与启动参数 --max-model-len；禁用未经该 checkpoint 训练的外推参数（如擅自开启 yarn/longrope）'
+      verification: '分别在 512 / 4k / 8k token 输入下跑 temp=0 固定问题，输出均语义正确且可复现'
+      rollback: '回滚 config.json 与启动参数到采集时的快照（脚本已留存字段值）'
+      riskLevel: medium
+  - id: rc-qg-003
+    when: 'quality\.deterministic=false'
+    signalExample: 'DSH-SIGNAL quality.deterministic=false'
+    judgement: decisive
+    decisiveRationale: '命中的是探针自动比对的结果字段 `quality.deterministic=false`：探针以 temp=0 + 固定 seed 连发两次同 prompt 并逐字比对，false 表示两次输出不一致。采样随机性已被 temp=0/固定 seed 消除，故该取值直接指向"非确定性计算路径"，单行即足够。'
+    hypothesis: '温度 0 下输出仍不可复现：指向非确定性计算路径（算子 reduce 顺序、并行通信、KV/前缀缓存复用、动态 batching 串味），而非采样随机性'
+    minEvidence: 1
+    strong: true
+    relevance: '探针已自动比对两次 temp=0 输出；不一致即命中。此项可先排除"采样参数"这一整类假设'
+    fix:
+      mode: partial
+      code: pending
+      note: '需二分定位：先关闭 prefix caching / 动态 batching 复测，再降为单卡 TP=1 复测，最后固定算子精度模式；每一步的差异即是根因所在'
+      verification: '每次改动后同 prompt 连跑 3 次：输出逐字一致'
+      rollback: '每次仅改一项并记录原值，可逐项回滚'
+      riskLevel: medium
+    needsProbes: [precision-log, serving-args]
+  - id: rc-qg-004
+    when: '--enable-prefix-caching|enable_prefix_caching[= ]|prefix_cache_hit_rate|--block-size[= ]|block_size[=:]|--max-num-seqs[= ]|max_num_seqs[=:]|kv_cache_dtype[=:]'
+    signalExample: ['--enable-prefix-caching', 'enable_prefix_caching=True', 'vllm:prefix_cache_hit_rate 0.42', '--block-size=128', 'block_size: 128', '--max-num-seqs=256', 'max_num_seqs: 256', 'kv_cache_dtype: auto']
+    judgement: contextual
+    hypothesis: 'KV/前缀缓存复用污染或动态 batching 串味：命中错误前缀会让回复"接错上下文"，表现为内容错位、语言混杂'
+    minEvidence: 1
+    relevance: '启动参数/环境命中缓存或调度配置；判别实验：重启服务后首个请求是否正常、单请求串行是否正常'
+    fix:
+      code: '关闭 prefix caching 与动态 batching（或把 max_num_seqs 设为 1）后复测；若恢复正常，再逐项打开定位触发项'
+      verification: '关闭后同 prompt 连跑 5 次 + 并发 4 路同 prompt 各跑 1 次：输出与单路一致'
+      rollback: '恢复原启动参数（脚本已留存完整 cmdline）'
+      riskLevel: low
+  - id: rc-qg-005
+    when: 'tensor.?parallel|pipeline.?parallel|world_size|tp_size|num_local_experts|expert.?parallel'
+    signalExample: ['tensor_parallel_size=4', 'pipeline_parallel_size=1', 'world_size=8', 'tp_size=4', '"num_local_experts": 64', 'expert_parallel_size=2']
+    judgement: contextual
+    hypothesis: '并行切分与权重分片不匹配（TP/EP 数与 checkpoint 分片不一致）：每卡加载到错位权重，输出通顺但语义崩坏'
+    minEvidence: 1
+    relevance: '启动参数 + weights.shards_declared / weights.shards_present 需交叉；判据是"单卡 TP=1 是否正常"'
+    fix:
+      code: '按 checkpoint 的分片声明核对并行度：TP 数必须整除 num_attention_heads 与 num_key_value_heads；MoE 模型核对 num_local_experts 与实际分片；先在 TP=1 单卡上验证模型本身可用'
+      verification: 'TP=1 与当前 TP 配置跑同一 temp=0 prompt：若 TP=1 正常而原配置乱，定位为切分/通信问题'
+      rollback: '恢复原并行参数；单卡验证用独立实例，不影响生产'
+      riskLevel: high
+  - id: rc-qg-006
+    when: 'speculative|draft'
+    signalExample: ['speculative_config=None', 'draft_model=/models/draft', 'num_speculative_tokens=5']
+    judgement: contextual
+    hypothesis: '推测解码 draft 与 target 模型不同源或词表不一致：被接受的 draft token 与 target 分布不符，输出呈"局部通顺、整体错乱"'
+    minEvidence: 1
+    relevance: '启动参数命中推测解码配置；判别实验：关闭推测解码立刻复测'
+    fix:
+      code: '关闭推测解码（--speculative-model / num_speculative_tokens 置 0）复测；若恢复，则确认 draft 与 target 必须同源同词表'
+      verification: '关闭前后同 prompt temp=0 对比：关闭后输出正常即定位'
+      rollback: '恢复原推测解码参数'
+      riskLevel: low
+  - id: rc-qg-007
+    when: 'fallback|aicore|overflow|nan\b|inf\b|unsupported|aclnn|算子回退|精度异常'
+    signalExample: ['operator fallback to aicpu', 'aicore timeout on stream 3', 'int32 overflow detected', 'attention output contains nan', 'logits contain inf', 'unsupported op type', 'aclnnAddCustom failed', '算子回退到 CPU 实现', '检测到精度异常']
+    judgement: contextual
+    hypothesis: '算子精度问题或算子回退（部分算子走低精度累加/回退路径）：单层误差经 N 层放大后 logits 崩坏'
+    minEvidence: 1
+    relevance: '引擎日志命中精度/回退关键词；需与"哪些层/哪些算子"的日志行交叉定位'
+    fix:
+      mode: partial
+      code: pending
+      note: '先按日志定位具体算子与回退原因，再决定：换用高精度算子实现、关闭该算子的融合优化、或升级 HDK/算子库版本'
+      verification: '替换/关闭该算子后跑固定 prompt 3 次一致；并用同一输入比对 CPU/NPU logits 前 10 名 token 是否一致'
+      rollback: '保留算子库版本与开关原值，可逐项回退'
+      riskLevel: high
+    needsProbes: [precision-log]
+  - id: rc-qg-008
+    when: 'tokenizer_class|vocab_size|add_bos_token|add_eos_token|tokenizer_config'
+    signalExample: ['"tokenizer_class": "Qwen2Tokenizer"', '"vocab_size": 151936', '"add_bos_token": false', '"add_eos_token": false', 'tokenizer_config.json found']
+    judgement: contextual
+    hypothesis: 'tokenizer 与权重不同源（拿了 base 模型的 tokenizer、或词表/special tokens 被替换）：token id 映射错位，输出呈"像词但不是词"的乱码'
+    minEvidence: 1
+    relevance: 'tokenizer 指纹与 config 的 vocab_size 需与权重发布包一致；判别实验：对已知文本做 tokenize，token id 序列与官方实现比对'
+    fix:
+      code: '用模型发布包内的 tokenizer 全套文件（tokenizer.json / tokenizer_config.json / special_tokens_map.json / vocab / merges）整体替换，禁止混用；核对 config.vocab_size 与 tokenizer 实际词表大小一致'
+      verification: 'tokenize 固定文本（含中英混排与特殊字符）→ token id 序列与官方 tokenizer 完全一致；再跑 temp=0 prompt 语义正确'
+      rollback: '保留原 tokenizer 目录 tar 包与 sha256，失败整体回滚'
+      riskLevel: medium
+  - id: rc-qg-009
+    when: 'temperature|top_p|top_k|repetition_penalty|presence_penalty|frequency_penalty'
+    signalExample: ['temperature=0.7', 'top_p=0.9', 'top_k=50', 'repetition_penalty=1.1', 'presence_penalty=0.0', 'frequency_penalty=0.0']
+    judgement: contextual
+    hypothesis: '采样参数异常（温度过高、top_p/top_k 过宽、重复惩罚过大）导致分布被拉平或截断，表现为语言混杂与自我重复'
+    minEvidence: 1
+    relevance: '此为最便宜的一刀：若温度 0 下仍乱码，则整类采样假设被排除（见 rc-qg-003）'
+    fix:
+      code: '先用 temperature=0、top_p=1 复测确认模型本身是否正常；生产参数建议 temperature<=0.7、top_p<=0.9，禁用与模型训练不一致的惩罚项'
+      verification: 'temp=0 输出语义正确且可复现；再按生产参数跑 5 次无语言混杂'
+      rollback: '恢复原采样参数（服务端默认值与会话参数两处）'
+      riskLevel: low
+  - id: rc-evi-001
+    when: 'evidence\.missing\.'
+    signalExampleExempt: 'when 匹配 evidence.missing.*，是通用证据缺口声明（不主张成因）'
+    judgement: contextual
+    hypothesis: '证据缺口声明：本报告缺少判定下述结论所必需的证据（不是根因，是"不能下结论"的显式标注）。缺 response_body 时无法判定输出内容；缺 client_request_params 时无法判定采样类假设；缺 metrics_endpoint 时无法做时间/计数关联；缺 per_request_binding 时无法把坏样本绑定到具体 engine/rank'
+    minEvidence: 1
+    strong: true
+    relevance: '用于防止"证据缺失被当成已排除"，并指明需要开启哪一项采集（每一项都有对应的开启方式）'
+    fix: null

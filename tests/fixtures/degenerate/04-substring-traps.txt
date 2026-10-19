@@ -1,0 +1,22 @@
+=== vllm-log ===
+--- cmd: probe-vllm-log
+(EngineCore pid=140) INFO Initializing a V1 LLM engine with config: speculative_config=None, tokenizer_mode=auto, dtype=torch.bfloat16, kv_cache_dtype=auto, enable_prefix_caching=True, cudagraph_capture_sizes=[1, 2, 4, 96, 104]
+(APIServer pid=1)     uvloop.run(run_server(args))
+=== end:vllm-log ===
+=== chat-template ===
+--- cmd: probe-chat-template
+DSH-SIGNAL chat_template.container_vllm_pid=1 (容器 PID1 常是启动脚本，故按进程名找)
+=== end:chat-template ===
+=== quality-probe ===
+--- cmd: probe-quality-probe
+--- temp0-run1(core): 
+--- temp0-run2(core): 
+=== end:quality-probe ===
+=== logits-probe ===
+--- cmd: probe-logits-probe
+DSH-SIGNAL logits.prefill_repeat_consistent=n/a (端点未返回可解析的 logprobs：**不下结论**)
+=== end:logits-probe ===
+=== tokenizer-fingerprint ===
+--- cmd: probe-tokenizer-fingerprint
+DSH-SIGNAL tokenizer.roundtrip=n/a (端点无有效 tokenize 响应，不下结论)
+=== end:tokenizer-fingerprint ===

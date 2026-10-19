@@ -1,0 +1,26 @@
+{
+  "schema": "1",
+  "note": "C 范式（一致性）环境差异路径要抽取的指纹键名。**为什么在 L1 而不是 src/**：这些键名带框架/硬件品牌（§3.1 硬约束 1：src/ 核心零品牌硬编码）；键名属现场可扩展的数据，新增采集项只需改本文件，不改代码、不重启。",
+  "loadOrder": [
+    "framework",
+    "runtime",
+    "hardware"
+  ],
+  "keys": [
+    "pkg.vllm",
+    "pkg.vllm-ascend",
+    "pkg.torch",
+    "pkg.torch_npu",
+    "pkg.transformers",
+    "in_container.vllm",
+    "in_container.torch",
+    "in_container.torch_npu",
+    "torch_npu.available",
+    "npu.device_count",
+    "vllm.proc.pid",
+    "vllm.container",
+    "quality.model",
+    "serve.cmdline_chars",
+    "metrics.family_count"
+  ]
+}

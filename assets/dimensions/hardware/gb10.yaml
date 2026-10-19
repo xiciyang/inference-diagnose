@@ -1,0 +1,47 @@
+id: gb10
+kind: hardware
+displayName: NVIDIA GB10（Grace Blackwell 一体化芯片，aarch64，统一内存）
+version: 1
+# 2026-09-28（长任务 1 / A1）：本机实测硬件。
+# 取证：`nvidia-smi` 报 `NVIDIA GB10`，Driver 580.126.09 / CUDA 13.0，`uname -m` = aarch64。
+#
+# 与本文件成对的通用维度是 hardware/nvidia.yaml（通用 NVIDIA CUDA 卡）。
+# 两者探针集**刻意保持同形**：hardware 维度在一次组合里只取一个，
+# 不存在"gb10 继承 nvidia"的机制，故各自必须自足（数据文件重复优于隐式继承）。
+#
+# GB10 的两处实测差异，已写进探针而不写进规则（规则只吃证据）：
+#   ① 统一内存（LPDDR5X 与 CPU 共享），`nvidia-smi` 的 Memory-Usage 报 Not Supported；
+#      显存不足的真实形态是**宿主可用内存不足**，故本维度同时采集 host-mem / host-limits。
+#   ② ECC / Fan 报 N/A（无 HBM、无独立风扇）—— 采集照跑，规则只在真出现
+#      `uncorrectable` 字样时才命中，不会把 `N/A` 误判成健康。
+probes:
+  - id: nv-device
+    section: nv-device
+    command: "if command -v nvidia-smi >/dev/null 2>&1; then echo \"DSH-SIGNAL nv.smi.available=true\"; nvidia-smi 2>&1 | head -40; else echo \"DSH-SIGNAL nv.smi.available=false (nvidia-smi 不存在：容器内未挂驱动工具或非 NVIDIA 宿主)\"; fi"
+  - id: nv-driver-matrix
+    section: nv-driver-matrix
+    command: "if command -v nvidia-smi >/dev/null 2>&1; then echo \"DSH-SIGNAL nv.driver.version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)\"; echo \"DSH-SIGNAL nv.gpu.name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)\"; echo \"DSH-SIGNAL nv.compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)\"; echo \"DSH-SIGNAL nv.memory.total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1)\"; cat /proc/driver/nvidia/version 2>/dev/null | head -3 || echo \"DSH-SIGNAL nv.proc.version=missing\"; else echo \"DSH-SIGNAL nv.driver.matrix=unavailable\"; fi"
+  - id: nv-ecc
+    section: nv-ecc
+    command: "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi -q -d ECC 2>&1 | grep -aE \"ECC Mode|Volatile|Aggregate|Uncorrectable|Corrected|N/A\" | head -40; else echo \"DSH-SIGNAL nv.ecc=unavailable\"; fi"
+  - id: nv-thermal
+    section: nv-thermal
+    command: "if command -v nvidia-smi >/dev/null 2>&1; then S=${THERMAL_SAMPLES:-6}; I=${THERMAL_INTERVAL:-10}; echo \"DSH-SIGNAL nv.thermal.samples=$S interval=${I}s\"; for i in $(seq 1 \"$S\"); do nvidia-smi --query-gpu=temperature.gpu,clocks_throttle_reasons.active,power.draw --format=csv,noheader 2>&1; sleep \"$I\"; done; else echo \"DSH-SIGNAL nv.thermal=unavailable\"; fi"
+  - id: nv-xid
+    section: kernel-log
+    command: "dmesg 2>/dev/null | grep -aE \"NVRM|Xid|nvrm\" | tail -n 120 || echo \"DSH-SIGNAL nv.xid=unavailable (dmesg 需 root 或权限受限)\""
+  - id: nv-topology
+    section: nv-topology
+    command: "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi topo -m 2>&1 | head -20; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | head -20; else echo \"DSH-SIGNAL nv.topology=unavailable\"; fi"
+  - id: kernel-log
+    section: kernel-log
+    command: "dmesg 2>/dev/null | tail -n 300 || echo \"DSH-SIGNAL kernel.log=unavailable (dmesg 需 root 或权限受限)\""
+  - id: host-mem
+    section: host-mem
+    command: "echo \"DSH-SIGNAL mem.total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)\"; echo \"DSH-SIGNAL mem.available_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\"; echo \"DSH-SIGNAL mem.swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)\"; free -m 2>/dev/null | head -4; head -5 /proc/meminfo 2>/dev/null"
+  - id: host-limits
+    section: host-limits
+    command: "echo \"DSH-SIGNAL ulimit.nofile=$(ulimit -n 2>/dev/null)\"; echo \"DSH-SIGNAL ulimit.nproc=$(ulimit -u 2>/dev/null)\"; echo \"DSH-SIGNAL cgroup.memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)\"; echo \"DSH-SIGNAL cgroup.memory.current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo unknown)\"; df -h 2>/dev/null | head -12"
+ruleRefs:
+  - root-causes/hardware-nvidia-rules.yaml
+  - root-causes/hardware-host-rules.yaml

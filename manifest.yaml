@@ -1,0 +1,96 @@
+# 能力清单（安全声明）—— inference-diagnose（长任务 1 / A2 新增）
+#
+# 语义：本清单是**白名单**。未声明的 capability 一律视为"未声明所以拒绝"，
+# 与"设计上不做"（not_provided）显式区分开 —— 后者此前在本包里是缺失的。
+#
+# 风险档沿用推理三插件（inference-serving / quantization / tuning）已固化的定义
+# （同一台机器、同一套资产规则，只应有**一套**词表）：
+#   read   = R0/R1 只读业务动作，无沙箱要求，**不需要确认令牌**
+#   write  = R1/R2 写操作，需容器级沙箱，需确认令牌
+#   system = R4 系统级，需 VM 级沙箱 —— 本机无 VM 沙箱，故一律拒绝
+#
+# 实测依据：本机沙箱能力 process ✗ / container ✓ / vm ✗
+# （inference-integration/NEXT_STEPS.md §5）。
+#
+# 与 src/governance/risk.mjs 的关系：本文件是**给人看/给审计看**的声明面，
+# risk.mjs 是**给代码看**的真源；`tests/unit/governance.spec.mjs` 断言两者逐工具相等，
+# 且与实际注册的工具名相等（声明漂移是这套机制唯一真正的失败模式）。
+
+name: inference-diagnose
+version: 0.0.1
+interface:
+  # 本包**不提供** MCP server、也**不提供** CLI —— 它只注册 5 个 DSH 工具。
+  # 显式写出来（而不是省略）是为了让"没有接口"与"忘了写"可区分。
+  mcp: "none"
+  cli: "none"
+
+capabilities:
+  - id: generate_collect_script
+    risk: read
+    sandbox: none
+    idempotent: true
+    confirmation: not-required
+    resources: ['model:read', 'disk:write']
+    note: 只在内存里生成一段采集脚本文本，不执行、不落盘（disk:write 仅指本地审计留痕）
+  - id: parse_collect_report
+    risk: read
+    sandbox: none
+    idempotent: true
+    confirmation: not-required
+    resources: ['model:read', 'disk:write']
+    note: 全程内存；报告文本不落盘、不日志、不回显（§2.5 不变量）
+  - id: diagnose_service
+    risk: read
+    sandbox: none
+    idempotent: true
+    confirmation: not-required
+    resources: ['model:read', 'state:write', 'disk:write']
+    note: A 范式诊断；state:write 仅写跨轮会话白名单字段
+  - id: diagnose_regression
+    risk: read
+    sandbox: none
+    idempotent: true
+    confirmation: not-required
+    resources: ['model:read', 'state:write', 'disk:write']
+    note: B 范式诊断；客户提供的基线只读、不落盘、不缓存
+  - id: diagnose_consistency
+    risk: read
+    sandbox: none
+    idempotent: true
+    confirmation: not-required
+    resources: ['model:read', 'state:write', 'disk:write']
+    note: C 范式诊断；复用 A 的状态机，不新建拓扑
+
+# 五个工具全为 read ⇒ 全插件**不需要确认令牌**。
+# 这一条由 tests/unit/governance.spec.mjs 断言（含"全部工具都声明了 not-required"）。
+
+not_provided:
+  - id: execute_collect_script
+    risk: system
+    reason: 采集脚本必须在**用户自己的机器**上执行（本插件的全部价值就是"不接触被诊断系统"）。执行属 R3/R4，本机无 VM 沙箱 → 一律拒绝；脚本由用户自行审阅后执行。
+  - id: read_remote_host
+    risk: system
+    reason: 不建立到被诊断主机的任何连接（无 ssh / 无 agent 下发 / 无 HTTP 回连）。证据一律由用户贴回。
+  - id: modify_user_system
+    risk: system
+    reason: 不修改被诊断系统的任何文件、进程、容器、内核参数或驱动。五个工具全部落在 read 档。
+  - id: store_report_plaintext
+    risk: system
+    reason: 硬性不做：报告文本（可能含未脱敏内容）绝不落盘、不记日志、不回显 —— 审计只存参数摘要（sha256）与参数名列表。
+  - id: confirmation_token
+    risk: system
+    reason: 本插件不实现确认令牌机制 —— 因为没有任何 write/system 档动作需要它。若未来引入写操作，必须先补令牌闸门，不能只改 risk 声明。
+
+dependencies:
+  - name: "@ai-infra/audit-core"
+    via: internal-transition
+    purpose: 审计哈希链的宿主（**该库在本机不存在** → 包内 src/governance/audit.mjs 实现 + CI 契约一致性检查）
+    required: false
+  - name: "@ai-infra/state-codec"
+    via: internal-transition
+    purpose: 共享状态方言的宿主（本包不读写共享状态根，故仅登记、不依赖）
+    required: false
+
+host:
+  node: ">=20.11.0"
+  runtimeDependencies: 0

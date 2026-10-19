@@ -1,0 +1,131 @@
+id: framework-vllm-rules
+version: 1
+# vLLM（Ascend 后端）根因规则簇 —— 2026-09-23 新增（纯数据，L1 热加载）。
+# 覆盖"服务正常但输出乱"这一类：量化/精度、位置与长度、引擎版本矩阵、并行配置、
+# 调度与 KV 缓存、图模式编译、推测解码、tokenizer 往返、chat template。
+appliesTo:
+  framework: vllm
+rules:
+  - id: rc-vllm-001
+    when: '--quantization|quant_method|kv-cache-dtype|load_in_8bit|load_in_4bit|w8a8|w4a16|fp8|int8'
+    signalExample: ['--quantization=compressed-tensors', '"quant_method": "compressed-tensors"', '--kv-cache-dtype=auto', 'load_in_8bit=True', 'load_in_4bit=True', 'quantization=w8a8', 'quantization=w4a16', 'quantization=fp8', 'quantization=int8']
+    judgement: contextual
+    hypothesis: '量化配置或 KV cache dtype 与 checkpoint 不匹配（含 kv-cache-dtype 与权重 dtype 组合不当）：反量化/缓存精度误差逐层放大，输出通顺但语义崩坏'
+    minEvidence: 1
+    strong: true
+    relevance: '启动参数或模型 config 命中量化字段；需与发布包的量化声明及 kv-cache-dtype 组合逐项核对'
+    fix:
+      code: '按发布包声明对齐：量化权重用对应 --quantization；不确定时先以未量化 bf16 checkpoint + 默认 kv-cache-dtype 跑通基线，再逐项打开量化'
+      verification: '同一 temp=0 固定 prompt 连跑 3 次逐字一致且语义正确；再跑 8k 长上下文同样的固定问题'
+      rollback: '保留原启动参数与量化配置（报告已留存完整 cmdline），失败按原值回滚'
+      riskLevel: high
+  - id: rc-vllm-002
+    when: '--max-model-len|max_position_embeddings|rope_scaling|rope_theta|--rope-scaling|--rope-theta'
+    signalExample: ['--max-model-len 8192', '"max_position_embeddings": 32768', '"rope_scaling": {"type": "yarn"}', '"rope_theta": 1000000.0', '--rope-scaling yarn', '--rope-theta 1000000']
+    judgement: contextual
+    hypothesis: '长度/位置编码配置超出该 checkpoint 的训练范围（--max-model-len 大于 max_position_embeddings，或擅自开启 rope scaling）：短 prompt 尚可、长 prompt 先崩坏'
+    minEvidence: 1
+    relevance: '启动参数与 config 的 rope 字段需交叉核对；判据是"短 prompt 正常 + 长 prompt 乱"的对照'
+    fix:
+      code: '令 --max-model-len <= config.max_position_embeddings，或仅在 checkpoint 明确支持时启用对应 rope_scaling/rope_theta；撤销未经训练的外推参数'
+      verification: '512 / 4k / 8k token 输入各跑一次 temp=0 固定问题：均语义正确且可复现'
+      rollback: '回滚启动参数与 config.json（报告已留存原值）'
+      riskLevel: medium
+  - id: rc-vllm-003
+    when: 'use_v1|vllm-ascend|vllm_ascend|pkg\.vllm=|pkg\.torch_npu='
+    signalExample: ['VLLM_USE_V1=1', 'use_v1=True', 'Name: vllm-ascend  Version: 0.9.1', 'import vllm_ascend ok', 'DSH-SIGNAL pkg.vllm=0.23.1rc1', 'DSH-SIGNAL pkg.vllm-ascend=0.9.1', 'DSH-SIGNAL pkg.torch_npu=2.5.1']
+    judgement: contextual
+    hypothesis: '版本矩阵错配（vllm / vllm-ascend / torch_npu / HDK 四者版本不在官方兼容列表内）或 V1/V0 引擎切换不当：算子实现差异导致数值偏差'
+    minEvidence: 1
+    needsProbes: [precision-log]
+    relevance: '命中 V1 引擎开关或版本号；需对照官方兼容矩阵（报告已采集各包版本）'
+    fix:
+      mode: partial
+      code: pending
+      note: '需按报告中的 pkg.vllm / pkg.vllm-ascend / pkg.torch_npu / pkg.torch 版本组合对照官方兼容矩阵，锁定一组已验证组合后再切换引擎开关复测'
+      verification: '切换后同 prompt temp=0 连跑 3 次一致；对比切换前的输出差异'
+      rollback: '保留原 pip 包与镜像 tag，可整体回滚'
+      riskLevel: high
+  - id: rc-vllm-004
+    when: '--tensor-parallel-size|--pipeline-parallel-size|--data-parallel|world_size|distributed-executor-backend|num_local_experts'
+    signalExample: ['--tensor-parallel-size 4', '--pipeline-parallel-size 1', '--data-parallel-size 2', 'world_size=4', 'distributed-executor-backend=mp', '"num_local_experts": 8']
+    judgement: contextual
+    hypothesis: '并行切分与权重分片不匹配（TP/PP/EP 配置与 checkpoint 分片不一致）：各卡加载错位权重，输出通顺而语义全错'
+    minEvidence: 1
+    relevance: '启动参数命中并行配置；判据是"TP=1 单卡是否正常"，以及权重分片声明数与实存数是否一致'
+    fix:
+      code: '核对 TP 必须整除 num_attention_heads 与 num_key_value_heads；MoE 模型核对 EP 与 num_local_experts；先在 TP=1 单卡实例上验证模型本身可用'
+      verification: 'TP=1 与当前配置跑同一 temp=0 prompt：TP=1 正常而原配置乱即可定位；再确认分片数一致'
+      rollback: '恢复原并行参数；单卡验证用独立实例，不影响生产'
+      riskLevel: high
+  - id: rc-vllm-005
+    when: 'prefix.?cach|--enable-chunked-prefill|--max-num-seqs|--max-num-batched-tokens|--block-size'
+    signalExample: ['--enable-prefix-caching', 'enable_prefix_caching=True', '--enable-chunked-prefill', '--max-num-seqs 256', '--max-num-batched-tokens 8192', '--block-size 128']
+    judgement: contextual
+    hypothesis: '调度或 KV/前缀缓存问题（前缀缓存命中错误、chunked prefill 与注意力实现组合不当、动态 batching 串味）：回复"接错上下文"，表现为内容错位'
+    minEvidence: 1
+    relevance: '启动参数命中缓存/调度项；判据是"重启后首个请求是否正常、单请求串行是否正常"'
+    fix:
+      code: '依次关闭 --enable-prefix-caching、--enable-chunked-prefill，并把 --max-num-seqs 降为 1 复测；每关一项复测一次以定位触发项'
+      verification: '关闭后同 prompt 连跑 5 次 + 并发 4 路同 prompt：输出与单路一致'
+      rollback: '恢复原启动参数（报告已留存完整 cmdline）'
+      riskLevel: low
+  - id: rc-vllm-006
+    when: 'speculative|--draft'
+    signalExample: ['--speculative-model /models/draft-qwen', '--num-speculative-tokens 5', 'speculative_config=None', '--draft-model /models/draft']
+    judgement: contextual
+    hypothesis: '推测解码 draft 与 target 不同源或词表不一致：被接受的 draft token 偏离 target 分布，输出局部通顺整体错乱'
+    minEvidence: 1
+    relevance: '启动参数命中推测解码；判据是关闭推测解码后是否立即恢复'
+    fix:
+      code: '将 --num-speculative-tokens 置 0 或去掉 --speculative-model 复测；确认启用时 draft 与 target 必须同源同词表'
+      verification: '关闭前后同 prompt temp=0 对比：关闭后正常即定位'
+      rollback: '恢复原推测解码参数'
+      riskLevel: low
+  - id: rc-vllm-007
+    when: '--enforce-eager|--compilation-config|cudagraph|torchair|aclgraph|ACL_GRAPH|FULL_DECODE_ONLY'
+    signalExample: ['--enforce-eager', '--compilation-config {"level": 3}', 'cudagraph_capture_sizes=[1, 96]', 'torchair graph enabled', 'aclgraph mode=2', 'ACL_GRAPH=1', 'FULL_DECODE_ONLY']
+    judgement: contextual
+    hypothesis: '图模式/编译路径问题（ACL graph 或 torchair 编译下的算子精度与回退差异）：eager 与 graph 结果不一致，图模式下输出退化'
+    minEvidence: 1
+    relevance: '命中图模式/编译开关；判据是 --enforce-eager 下是否恢复正常（这是最直接的 A/B）'
+    fix:
+      code: '加 --enforce-eager 复测；若恢复正常，则收敛到具体编译档位（关闭 cudagraph / 调整 compilation-config），并记录触发档位'
+      verification: 'eager 与 graph 两种模式下同 prompt temp=0 输出对比：eager 正常即为定位；随后再逐步恢复图模式定位具体档位'
+      rollback: '去掉 --enforce-eager 恢复原图模式'
+      riskLevel: medium
+  - id: rc-vllm-008
+    when: 'tokenizer\.roundtrip_ok=false'
+    signalExample: 'DSH-SIGNAL tokenizer.roundtrip_ok=false'
+    judgement: decisive
+    decisiveRationale: '命中的是探针自动比对的结果字段 `tokenizer.roundtrip_ok=false`：探针把同一段中英混排文本 tokenize→detokenize 回读并逐字比对，false 表示往返**不能还原**，即 token↔文本映射有损。映射无损时往返必然成功，故该取值是"tokenizer 与权重不同源"的充分必要条件，不需要任何其它证据。'
+    hypothesis: 'tokenizer 与权重不同源（词表/special tokens 错位）：token id 映射错误，输出呈"像词但不是词"的乱码'
+    minEvidence: 1
+    strong: true
+    relevance: '探针已用 /tokenize → /detokenize 往返自动判定；往返失败即强证据'
+    fix:
+      code: '用发布包内 tokenizer 全套文件整体替换（tokenizer.json / tokenizer_config.json / special_tokens_map.json / vocab / merges），禁止混用；核对 config.vocab_size 与实际词表大小'
+      verification: '往返判别恢复 true；再跑 temp=0 prompt 语义正确'
+      rollback: '保留原 tokenizer 目录 tar 包与 sha256，整体回滚'
+      riskLevel: medium
+  - id: rc-vllm-009
+    when: 'chat_template\.file=|chat template|tool-call-parser|enable-auto-tool-choice|--chat-template'
+    signalExample: ['DSH-SIGNAL chat_template.file=/app/template.jinja', 'chat template mismatch detected', '--tool-call-parser hermes', '--enable-auto-tool-choice', '--chat-template /app/template.jinja']
+    judgement: contextual
+    hypothesis: 'chat template 或工具调用解析器不匹配（模板与模型训练格式不一致，或把工具调用轨迹/代码语料直接续写）：表现为看似乱码的分布外续写'
+    minEvidence: 1
+    relevance: '报告已 dump 模板原文与工具调用风格请求的返回；判据是"纯文本单轮是否正常、带工具轨迹或带 system 的是否先乱"'
+    fix:
+      code: '改用模型发布包自带的 chat template（或 --chat-template 指向官方模板文件）；工具调用场景需同时匹配对应的 tool-call-parser，不要用通用模板硬套'
+      verification: '纯文本单轮 / 带 system / 带工具轨迹 三类请求各跑 temp=0 两次：均语义正确且格式符合预期'
+      rollback: '恢复原 --chat-template 参数与模板文件'
+      riskLevel: low
+  - id: rc-vllm-010
+    when: 'vllm\.proc\.pid=none|vllm\.log\.candidates=0|DSH-SIGNAL vllm\.container=$|quality\.probe=endpoint-unreachable|tokenizer\.roundtrip=n/a'
+    signalExampleExempt: 'when 匹配的是"探针没能取到证据"的缺席标记（pid=none / candidates=0 / container= 空 / endpoint-unreachable / roundtrip=n/a），本规则就是"缺什么"的声明，不主张任何成因'
+    judgement: contextual
+    hypothesis: '采集覆盖不足：未定位到 vLLM 服务进程/日志文件，或推理端点不可达（响应无 choices），本次分析缺少引擎侧与输出侧证据（此项不是根因，是证据缺口声明；用于避免把证据缺失误当已排除）'
+    minEvidence: 1
+    strong: true
+    relevance: '探针自报未找到进程/日志；用于避免"证据缺失被当成排除"的错误结论'
+    fix: null
