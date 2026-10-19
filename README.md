@@ -15,9 +15,12 @@ Offline, de-identified, hash-chained audit, and fail-closed when a rule for the
 ## 安装
 
 ```bash
-# 作为 DSH bundle 插件（装完重启生效）
-dsh plugin --profile <name> add @xiciyang/inference-diagnose
+git clone https://github.com/xiciyang/inference-diagnose.git
+cd inference-diagnose && bash scripts/build.sh
+dsh plugin --profile <name> add .
 ```
+
+> 尚未发布到 npm；上面的源码路径装完重启生效。
 
 要求 **Node ≥ 20**，已在本机 DSH **0.2.0-rc.2** 上验证。
 
